@@ -61,6 +61,9 @@ only_during_weather_event = {potions_only_during_weather_event}
 [aquarium]
 enabled = {aquarium_enabled}       # hourly feed; briefly resizes the game window to 1680x900
 
+[recovery]
+enabled = {recovery_enabled}       # rejoin Fisch when Sober closes or Roblox disconnects, then walk the recorded route
+
 [webhook]
 url = {webhook_url}                # Discord webhook URL
 summary_min = {webhook_summary_min}
@@ -117,6 +120,11 @@ class Aquarium:
 
 
 @dataclass
+class Recovery:
+    enabled: bool = False
+
+
+@dataclass
 class Webhook:
     url: str = ""
     summary_min: int = 30
@@ -130,6 +138,7 @@ class Config:
     totem: Totem = field(default_factory=Totem)
     potions: Potions = field(default_factory=Potions)
     aquarium: Aquarium = field(default_factory=Aquarium)
+    recovery: Recovery = field(default_factory=Recovery)
     webhook: Webhook = field(default_factory=Webhook)
 
     @property

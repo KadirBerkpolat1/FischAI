@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import hypr, screen
+from . import hypr, recovery, screen
 from .reeler import Reeler
 
 # Reel entry (fisch_data.lua, Windows values).
@@ -26,8 +26,9 @@ DUAL_ENTRY_MIN_CONF = 0.45
 ENTRY_DEBOUNCE_TICKS = 2
 SHAKE_TO_REEL_HINT_TICKS = 3
 MIN_COUNTED_REEL_S = 1.5        # shorter "reels" are detector blips, not catches
-NO_SHAKE_AFTER_CAST_S = 7.0     # no shake button at all this long after a cast: the cast did not land
 MAX_SNAPSHOTS = 400
+PROMPT_CHECK_AFTER_S = 60.0     # no reel for this long: start looking for Roblox's error prompt
+PROMPT_CHECK_EVERY_S = 30.0
 
 REEL_TICK_S = 0.016
 SHAKE_TICK_S = 0.008
@@ -37,16 +38,14 @@ SILENCE_RAMP_S = 1.5
 WINDOW_REFRESH_S = 1.0
 
 SHAKE_TIMEOUT_S = 16.0          # without a successful click
-# Longer than ExoPanda's 8/15 ms: in Sober, 15 ms clicks mostly left the
-# shake button where it was (an accepted shake moves it), while the long
-# presses of the cast and the reel did land.
-SHAKE_SETTLE_S = 0.030
-SHAKE_HOLD_S = 0.050
+# The press spans two game frames at 60 fps so the down and the up are never
+# read in the same frame.
+SHAKE_SETTLE_S = 0.016
+SHAKE_HOLD_S = 0.035
 SHAKE_JIGGLE_DY_PX = 3
 SHAKE_JIGGLE_GAP_S = 0.008
-SHAKE_SAME_BUTTON_PX = 30       # one button's detected centre wanders up to ~15 px between frames
-SHAKE_REARM_S = 0.400           # same spot, never seen gone: the click missed, retry
-SHAKE_NEAR_S = 1.0              # search around the last button first while it is this recent
+SHAKE_SAME_BUTTON_PX = 30
+SHAKE_REARM_S = 0.300           # same spot, never seen gone: the click missed, retry
 
 # The rod lives in hotbar slot 1. Alternating 2 -> 1 presses always end with
 # the rod in hand; pressing 1 alone would put an already-held rod away.
@@ -105,7 +104,7 @@ class GuardedInput:
         if self.stop_event.is_set():
             raise Stopped
         if self.focus.closed:
-            raise hypr.WindowError("The game window was closed.")
+            raise hypr.WindowClosed
         if not self.focus.is_focused():
             raise FocusLost
 
@@ -125,6 +124,14 @@ class GuardedInput:
     def press(self, key):
         self.check()
         self.io.press(key)
+
+    def key(self, name, down):
+        if down:
+            self.check()
+        self.io.key(name, down)
+
+    def release_key(self, name):
+        self.io.release_key(name)
 
     def release_all(self):
         self.io.release_all()
@@ -215,7 +222,7 @@ class ReelTelemetry:
     """How well the detector saw one reel, for the log line at its end."""
 
     def __init__(self):
-        self.frames = self.bar = self.fish = 0
+        self.frames = self.bar = self.fish = self.both = self.inside = 0
         self.bar_conf = self.fish_conf = 0.0
         self.last_frame_t = None
 
@@ -224,12 +231,16 @@ class ReelTelemetry:
             return
         self.last_frame_t = boxes.frame_t
         self.frames += 1
-        if boxes.bar is not None:
+        bar, fish = boxes.bar, boxes.fish
+        if bar is not None:
             self.bar += 1
-            self.bar_conf += boxes.bar.conf
-        if boxes.fish is not None:
+            self.bar_conf += bar.conf
+        if fish is not None:
             self.fish += 1
-            self.fish_conf += boxes.fish.conf
+            self.fish_conf += fish.conf
+        if bar is not None and fish is not None:
+            self.both += 1
+            self.inside += bar.x <= fish.cx <= bar.x + bar.w
 
     def summary(self):
         if not self.frames:
@@ -237,7 +248,10 @@ class ReelTelemetry:
 
         def seen(name, n, conf):
             return f"{name} in {n / self.frames:.0%} (avg {conf / n:.2f})" if n else f"{name} never seen"
-        return f"{self.frames} frames, {seen('bar', self.bar, self.bar_conf)}, {seen('fish', self.fish, self.fish_conf)}"
+        text = f"{self.frames} frames, {seen('bar', self.bar, self.bar_conf)}, {seen('fish', self.fish, self.fish_conf)}"
+        if self.both:
+            text += f", fish inside the bar {self.inside / self.both:.0%}"
+        return text
 
 
 @dataclass
@@ -250,6 +264,7 @@ class Stats:
     totems: int = 0
     potion_rounds: int = 0
     aquarium_sweeps: int = 0
+    rejoins: int = 0
 
 
 class Shaker:
@@ -368,7 +383,7 @@ def _write_float(path, value):
 
 
 class Macro:
-    def __init__(self, cfg, win, io, focus, bridge, vision, state_dir, log, status, stop_event, stats):
+    def __init__(self, cfg, win, io, focus, bridge, vision, state_dir, log, status, notify, stop_event, stats):
         self.cfg = cfg
         self.win = win
         self.raw_io = io
@@ -379,6 +394,7 @@ class Macro:
         self.vision = vision
         self.log = log
         self.status = status
+        self.notify = notify                # Discord message
         self.stop_event = stop_event
         self.stats = stats
         self.pointer = Pointer(self.io)
@@ -397,16 +413,15 @@ class Macro:
         self.reel_telemetry = ReelTelemetry()
         self.cast_shake_clicks = 0
         self.cast_t = -math.inf
-        self.shake_last_hit = None
-        self.shake_last_hit_t = -math.inf
         self.last_bar_seen = -math.inf
         self.last_fish_seen = -math.inf
         self.consec_fish = 0
         self.shake_hint_frames = 0
-        self.shake_clicked_this_cast = False
         self.waiting_for_bite = False
         self.recast_anchor = None
         self.last_activity = time.monotonic()
+        self.last_reel_activity = time.monotonic()
+        self.prompt_checked = -math.inf
         self.last_equip = -math.inf
         self.totem_fired_cycle = None
         self.totem_last_fire = -math.inf
@@ -470,6 +485,7 @@ class Macro:
         self.waiting_for_bite = False
         self.recast_anchor = None
         self.phase = "cast"
+        self.last_reel_activity = now
         duration = now - self.reel_started
         if duration >= MIN_COUNTED_REEL_S:
             self.stats.reels += 1
@@ -493,16 +509,30 @@ class Macro:
     def run(self):
         hypr.focus(self.win)
         self.sleep(0.3)
-        equipped = False
+        equipped = paused = walk_pending = False
+        lost = None
         try:
             while True:
                 try:
+                    if lost:
+                        self._recover(lost)
+                        lost, equipped, walk_pending = None, False, True
+                    if paused:
+                        self._pause_until_focused()
+                        paused = False
+                    if walk_pending:
+                        walk_pending = False     # a walk cut short by a focus change is not restarted
+                        self._walk_route()
                     if not equipped:
                         self._equip_rod(full=True)
                         equipped = True
                     self._step()
                 except FocusLost:
-                    self._pause_until_focused()
+                    paused = True
+                except (hypr.WindowClosed, recovery.GameLost) as e:
+                    if not self.cfg.recovery.enabled:
+                        raise
+                    lost, paused = str(e), False
         except Stopped:
             pass
         finally:
@@ -523,11 +553,64 @@ class Macro:
         self.log("paused: Sober lost focus")
         while not self.focus.is_focused():
             if self.focus.closed:
-                raise hypr.WindowError("The game window was closed.")
+                raise hypr.WindowClosed
             self.sleep(0.1)
         self.log("resumed")
         self.pointer.pos = None
         self.sleep(0.2)
+
+    # -- recovery --------------------------------------------------------------
+
+    def _check_error_prompt(self, now):
+        """Fishing stalled: look for Roblox's error prompt (OCR, ~0.2 s)."""
+        if now - self.last_reel_activity < PROMPT_CHECK_AFTER_S or now - self.prompt_checked < PROMPT_CHECK_EVERY_S:
+            return
+        self.prompt_checked = now
+        if recovery.error_prompt(self.grab_window()):
+            raise recovery.GameLost("Roblox showed its error prompt")
+
+    def _recover(self, why):
+        why = why.rstrip(".")
+        self.reeler.release()
+        self.raw_io.release_all()
+        self.bridge.active = False
+        self.stats.rejoins += 1
+        self.log(f"recovery: {why}; restarting Sober into Fisch")
+        self.notify(f"Lost the game ({why}), rejoining Fisch.")
+        match = self.cfg.general.window
+        for attempt in range(1, recovery.ATTEMPTS + 1):
+            self.status("recovery", f"rejoining Fisch, attempt {attempt}")
+            recovery.restart_sober(match, self.sleep)
+            win = recovery.wait_for_fisch(match, self.vision.cycle, self.sleep)
+            if win is not None:
+                break
+            self.log(f"recovery: Fisch did not load (attempt {attempt} of {recovery.ATTEMPTS})")
+        else:
+            raise hypr.WindowError(f"Could not get back into Fisch after {recovery.ATTEMPTS} attempts.")
+        self.win = win
+        self.focus.retarget(win.address)
+        self.reeler.forget_walls()
+        hypr.focus(win)
+        self.sleep(recovery.SPAWN_SETTLE_S)
+        self.phase = "cast"
+        self.reeling = False
+        self.waiting_for_bite = False
+        self.recast_anchor = None
+        self.consec_fish = self.shake_hint_frames = 0
+        self.shaker.reset()
+        self.pointer.pos = None
+        self.last_reel_activity = time.monotonic()
+        self.log("recovery: back in Fisch")
+        self.notify("Back in Fisch.")
+
+    def _walk_route(self):
+        route = recovery.load_route(self.state_dir / recovery.ROUTE_FILE)
+        if route is None:
+            self.log("recovery: no route recorded, fishing from the spawn point")
+            return
+        self.status("recovery", "walking to the fishing spot")
+        self.log(f"recovery: walking the recorded route ({route[-1][0]:.1f} s)")
+        recovery.walk(self.io, route, self.sleep)
 
     def _step(self):
         now = time.monotonic()
@@ -572,12 +655,14 @@ class Macro:
             self.sleep(REEL_TICK_S)
         elif self.phase == "shake":
             self.bridge.active = True
+            self._check_error_prompt(now)
             reel_hint = both_now and boxes.bar.conf >= DUAL_ENTRY_MIN_CONF
             self._shake_step(now, fish_now or both_now, reel_hint)
             self.sleep(SHAKE_TICK_S)
         else:
             self.bridge.active = False
             self.reeler.release()
+            self._check_error_prompt(now)
             self._idle_step(now)
             silent = time.monotonic() - self.last_activity
             fast = self.waiting_for_bite or silent < SILENCE_RAMP_S
@@ -605,22 +690,15 @@ class Macro:
         hit = frame = None
         if self.cfg.fishing.auto_shake:
             frame = self.grab_window()
-            near = self.shake_last_hit if now - self.shake_last_hit_t < SHAKE_NEAR_S else None
-            hit = self.vision.shake.find(frame, first_look=not self.shake_clicked_this_cast, now=now, near=near)
+            hit = self.vision.shake.find(frame)
         if hit is not None:
-            self.shake_last_hit, self.shake_last_hit_t = hit, now
-            self.shake_clicked_this_cast = True
             self._mark_activity()
             result = self.shaker.click(self.win.x + hit[0], self.win.y + hit[1], suppress, now)
             if result == "clicked":
                 self.stats.shake_clicks += 1
                 self.cast_shake_clicks += 1
-                self.status("shake", f"clicked ({self.vision.shake.last_method})")
+                self.status("shake", f"clicked (match {self.vision.shake.last_score:.2f})")
                 self._snap("shake", frame, [hit])
-        elif self.cfg.fishing.auto_shake and not self.shake_clicked_this_cast \
-                and now - self.cast_t > NO_SHAKE_AFTER_CAST_S:
-            self.log(f"shake: no button {NO_SHAKE_AFTER_CAST_S:.0f} s after the cast, casting again")
-            result = "timeout"
         else:
             result = self.shaker.wait(now)
             if result == "waiting":
@@ -670,7 +748,6 @@ class Macro:
         self.cast_shake_clicks = 0
         self.waiting_for_bite = True
         self.recast_anchor = None
-        self.shake_clicked_this_cast = False
         self.shake_hint_frames = 0
         self.shaker.reset()
         self.phase = "shake"

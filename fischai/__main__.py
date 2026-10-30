@@ -1,4 +1,4 @@
-"""Command line: fischai gui | setup | run | detect | record | doctor."""
+"""Command line: fischai gui | setup | run | detect | record | route | doctor."""
 
 import argparse
 import os
@@ -176,6 +176,31 @@ def cmd_record(args):
     print(f"saved {count} frames")
 
 
+def cmd_route(args):
+    """Record the walk from the spawn point to the fishing spot, replayed after a rejoin."""
+    from .recovery import ROUTE_FILE, ROUTE_KEYS, RouteRecorder, save_route
+    cfg = _load_config()
+    hotkey = cfg.general.hotkey.upper()
+    path = STATE_DIR / ROUTE_FILE
+    with single_instance():
+        recorder = RouteRecorder(cfg.general.hotkey)
+        print("Rejoin Fisch so you stand at the spawn point. In the game, press "
+              f"{hotkey}, walk to the fishing spot using only {' '.join(k.upper() for k in ROUTE_KEYS)}, "
+              f"face the water, then press {hotkey} again.")
+        try:
+            events = recorder.record(on_start=lambda: print("recording..."))
+        except KeyboardInterrupt:
+            raise SystemExit("cancelled, the old route is unchanged") from None
+        finally:
+            recorder.close()
+        if events is None:
+            raise SystemExit("cancelled, the old route is unchanged")
+    if not events:
+        raise SystemExit("no keys were pressed, the old route is unchanged")
+    save_route(path, events)
+    print(f"saved {len(events)} key events ({events[-1][0]:.1f} s) to {path}")
+
+
 def cmd_doctor(args):
     ok = True
 
@@ -190,6 +215,7 @@ def cmd_doctor(args):
     from .inputdev import _keyboard_event_paths
     readable = [p for p in _keyboard_event_paths() if os.access(p, os.R_OK)]
     check(readable, "keyboard readable for the hotkey", "sudo usermod -aG input $USER, then log in again")
+    check(shutil.which("tesseract"), "tesseract installed (spots Roblox's disconnect prompt)", "install tesseract")
     try:
         cfg = config.load()
         check(True, f"config {config.CONFIG_PATH}")
@@ -243,6 +269,8 @@ def main():
     p.add_argument("--seconds", type=float, default=60.0)
     p.add_argument("--fps", type=float, default=4.0)
     p.set_defaults(func=cmd_record)
+    p = sub.add_parser("route", help="record the walk from the spawn point to the fishing spot (used after a rejoin)")
+    p.set_defaults(func=cmd_route)
     p = sub.add_parser("doctor", help="check the environment")
     p.set_defaults(func=cmd_doctor)
     args = parser.parse_args()

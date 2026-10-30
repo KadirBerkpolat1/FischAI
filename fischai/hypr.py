@@ -20,6 +20,11 @@ class WindowError(Exception):
     pass
 
 
+class WindowClosed(WindowError):
+    def __init__(self):
+        super().__init__("The game window was closed.")
+
+
 @dataclass(frozen=True)
 class Window:
     address: str
@@ -94,7 +99,7 @@ def refresh(win):
     for client in _hyprctl_json("clients"):
         if client["address"] == win.address:
             return _to_window(client)
-    raise WindowError("The game window was closed.")
+    raise WindowClosed
 
 
 def active_address():
@@ -166,6 +171,12 @@ class FocusWatcher(threading.Thread):
         if not self.is_alive():
             return active_address() == self.address
         return self._active == self.address
+
+    def retarget(self, address):
+        """Follow a new game window (Sober was restarted)."""
+        self.address = norm_address(address)
+        self._active = active_address()
+        self.closed = False
 
     def run(self):
         buf = b""

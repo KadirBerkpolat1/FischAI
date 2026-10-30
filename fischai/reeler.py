@@ -14,8 +14,9 @@ the right one, release for the left) instead of oscillating against it.
 v_hat only advances on genuinely new observations, never on holdover frames.
 
 A perturb-and-observe learner tunes KP/KV per rod (keyed by bar width) from
-each reel's cost J = mean(err^2) + 300 * flips/s + 20 * max overshoot, and
-persists the table. The Requiem rod, which fails the catch when mouse events
+each reel's cost J = mean(out^2) + 30 * flips/s + 20 * max overshoot, where
+`out` is how far the fish sits outside the bar (catch progress only grows
+while it is inside), and persists the table. The Requiem rod, which fails the catch when mouse events
 come closer than ~300 ms, gets ExoPanda's separate gated bang-bang law.
 """
 
@@ -55,6 +56,8 @@ REQUIEM_FALL_THRESH_PX = 3
 REQUIEM_ARM_TIMEOUT_S = 2.0
 
 LEARN_BUCKET_PX = 8
+LEARN_MATCH_FRAC = 0.08       # one rod's detected bar width spans ~6% between reels (264-280 px)
+LEARN_JBEST_RELAX = 0.25      # a rejected probe pulls the best cost toward it: one lucky fish must not freeze learning
 LEARN_SAVE_MIN_S = 15.0
 LEARN_STEP_KP = 0.6
 LEARN_STEP_KV = 0.00018
@@ -63,10 +66,10 @@ LEARN_STEP_MIN_FRAC = 0.25
 LEARN_EMA_ALPHA = 0.4
 LEARN_KP_RANGE = (2.0, 14.0)
 LEARN_KV_RANGE = (0.0005, 0.004)
-LEARN_W_ERR, LEARN_W_FLIP, LEARN_W_OVER = 1.0, 300.0, 20.0
-LEARN_J_DIVERGE = 60000.0
+LEARN_W_OUT, LEARN_W_FLIP, LEARN_W_OVER = 1.0, 30.0, 20.0
+LEARN_J_DIVERGE = 40000.0     # mean squared distance outside the bar (~200 px RMS)
 LEARN_MIN_TICKS = 30
-LEARN_CLOSE_PX = 40.0
+LEARN_COST_VERSION = 2        # best costs saved under another cost definition are not comparable
 
 
 def _clamp(value, lo, hi):
@@ -102,11 +105,11 @@ class GainLearner:
         self.best_kp = self.best_kv = self.kp = self.kv = None
         self.jbest = None
         self.step_kp = self.step_kv = None
-        self.err2_sum = 0.0
+        self.out2_sum = 0.0
         self.ticks = 0
         self.flips = 0
         self.overshoot = 0.0
-        self.was_close = False
+        self.was_inside = False
         self.t0 = None
         self.diverged = False
 
@@ -115,7 +118,10 @@ class GainLearner:
             data = json.loads(self.path.read_text())
         except (OSError, ValueError):
             return
-        for bucket, entry in data.items():
+        if not isinstance(data, dict) or data.get("cost_version") != LEARN_COST_VERSION:
+            self.log("reel learner: saved gains were scored with an older cost, starting over")
+            return
+        for bucket, entry in data.get("rods", {}).items():
             try:
                 self.rods[int(bucket)] = RodGains(**entry)
             except (TypeError, ValueError):
@@ -126,7 +132,8 @@ class GainLearner:
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({str(b): asdict(g) for b, g in self.rods.items()}, indent=1))
+        rods = {str(b): asdict(g) for b, g in self.rods.items()}
+        tmp.write_text(json.dumps({"cost_version": LEARN_COST_VERSION, "rods": rods}, indent=1))
         tmp.replace(self.path)
 
     def gains(self, bar_width, now):
@@ -134,10 +141,12 @@ class GainLearner:
         if self.t0 is None:
             self.t0 = now
             self.bucket = int(bar_width // LEARN_BUCKET_PX)
+            nearest = min(self.rods, key=lambda b: abs(b - self.bucket), default=None)
+            if nearest is not None and abs(nearest - self.bucket) * LEARN_BUCKET_PX <= bar_width * LEARN_MATCH_FRAC:
+                self.bucket = nearest
             entry = self.rods.get(self.bucket)
             if entry is None:
-                nearest = min(self.rods.items(), key=lambda kv: abs(kv[0] - self.bucket), default=None)
-                seed_kp, seed_kv = (nearest[1].kp, nearest[1].kv) if nearest else (CAS_KP, CAS_KV)
+                seed_kp, seed_kv = (self.rods[nearest].kp, self.rods[nearest].kv) if nearest is not None else (CAS_KP, CAS_KV)
                 entry = RodGains(seed_kp, seed_kv, None, LEARN_STEP_KP, LEARN_STEP_KV)
                 self.rods[self.bucket] = entry
             self.best_kp, self.best_kv, self.jbest = entry.kp, entry.kv, entry.jbest
@@ -154,15 +163,15 @@ class GainLearner:
             return CAS_KP, CAS_KV
         return self.kp, self.kv
 
-    def observe(self, err_px):
+    def observe(self, out_px):
+        """One tick; `out_px` is how far the fish centre sits outside the bar (0 inside)."""
         self.ticks += 1
-        self.err2_sum += err_px * err_px
-        ae = abs(err_px)
-        if ae <= LEARN_CLOSE_PX:
-            self.was_close = True
-        elif self.was_close and ae > self.overshoot:
-            self.overshoot = ae
-        if not self.diverged and self.ticks >= 10 and LEARN_W_ERR * self.err2_sum / self.ticks > LEARN_J_DIVERGE:
+        self.out2_sum += out_px * out_px
+        if out_px == 0:
+            self.was_inside = True
+        elif self.was_inside and out_px > self.overshoot:
+            self.overshoot = out_px
+        if not self.diverged and self.ticks >= 10 and self.out2_sum / self.ticks > LEARN_J_DIVERGE:
             self.diverged = True
 
     def _anneal(self):
@@ -174,7 +183,7 @@ class GainLearner:
     def end_reel(self, now):
         if self.t0 is not None and self.ticks >= LEARN_MIN_TICKS:
             duration = max(now - self.t0, 0.1)
-            cost = (LEARN_W_ERR * self.err2_sum / self.ticks
+            cost = (LEARN_W_OUT * self.out2_sum / self.ticks
                     + LEARN_W_FLIP * self.flips / duration
                     + LEARN_W_OVER * self.overshoot)
             if self.diverged:
@@ -192,6 +201,7 @@ class GainLearner:
                 self.jbest = cost
             else:
                 action = "reject"
+                self.jbest += LEARN_JBEST_RELAX * (cost - self.jbest)
                 self._anneal()
             self.rods[self.bucket] = RodGains(self.best_kp, self.best_kv, self.jbest, self.step_kp, self.step_kv)
             best = cost if self.jbest is None else self.jbest
@@ -383,7 +393,7 @@ class Reeler:
 
         # A wall pin's large err is the fish's position, not a gain failure.
         if learning and self.wall_pin is None:
-            self.learner.observe(err)
+            self.learner.observe(max(0.0, abs(err) - bar_w / 2))
         if self.wall_pin is not None or (abs(err) < HOLD_STATION_PX and abs(self.vhat) < HOLD_STATION_VEL):
             self.stuck_ticks = 0
 

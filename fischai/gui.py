@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
 from . import __version__, config
 from .app import Controller, Log, assets_installed, single_instance
 from .config import DATA_DIR, STATE_DIR
+from .recovery import ROUTE_FILE, RouteRecorder, load_route, save_route
 
 PALETTE_FILE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ryoku" / "colors.json"
 FALLBACK_PALETTE = {
@@ -50,6 +52,7 @@ LOG_FONTS = ("SpaceMono Nerd Font", "Space Mono", "JetBrains Mono", "Noto Sans M
 REFRESH_MS = 200
 SAVE_DELAY_MS = 600
 LOG_LINES = 300
+ROUTE_HOTKEY_GRACE_S = 1.0
 
 # The fishing cycle shown at the top; idle-chain phases count as casting.
 STEPS = ("Atış", "Shake", "Çekme")
@@ -152,6 +155,8 @@ class Window(QWidget):
         self.save_timer.timeout.connect(self._save)
         self.saved_at = 0.0
         self.error_text = None
+        self.recorder = None
+        self.route_ended_at = -ROUTE_HOTKEY_GRACE_S
 
         self.setWindowTitle("FischAI")
         self.resize(480, 820)
@@ -241,6 +246,12 @@ class Window(QWidget):
         self._section("Akvaryum")
         self._switch("Saatte bir besle", c.aquarium, "enabled",
                      hint="Besleme sırasında pencere birkaç saniye 1680×900 olur.")
+
+        self._section("Bağlantı kopunca")
+        self._switch("Fisch'e geri gir", c.recovery, "enabled",
+                     hint="Sober kapanır ya da Roblox bağlantı hatası verirse Sober'ı yeniden açar, Fisch'e girer, "
+                          "doğduğun yerden balık yerine kayıtlı rotayı yürür ve balığa devam eder.")
+        self._route_row()
 
         self._section("Discord")
         self._text("Webhook adresi", c.webhook, "url", "https://discord.com/api/webhooks/…")
@@ -353,6 +364,27 @@ class Window(QWidget):
         edit.textChanged.connect(lambda t: self._set(target, attr, t.strip()))
         self._place(label, edit)
 
+    def _route_row(self):
+        key = self.cfg.general.hotkey.upper()
+        self.route_state = QLabel(objectName="value", alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.route_button = QPushButton("Kaydet")
+        self.route_button.clicked.connect(self._route_clicked)
+        holder = QHBoxLayout()
+        holder.setContentsMargins(0, 0, 0, 0)
+        holder.addStretch(1)
+        holder.addWidget(self.route_state)
+        holder.addWidget(self.route_button)
+        wrapper = QWidget()
+        wrapper.setLayout(holder)
+        self._place("Yürüme rotası", wrapper,
+                    hint=f"Fisch'e yeniden girip doğduğun yerde dur. Kaydet'e, sonra oyunda {key}'e bas; yalnız "
+                         f"W A S D, boşluk ve ok tuşlarıyla balık yerine yürü, suya dön ve {key}'e yine bas.")
+        self._show_route()
+
+    def _show_route(self):
+        route = load_route(STATE_DIR / ROUTE_FILE)
+        self.route_state.setText(f"{route[-1][0]:.1f} sn" if route else "kayıtlı değil")
+
     # -- behaviour -----------------------------------------------------------
 
     def _set(self, target, attr, value):
@@ -375,18 +407,60 @@ class Window(QWidget):
         self.start_button.setEnabled(True)
 
     def hotkey(self):
-        self.events.put("toggle")
+        # The hotkey also starts and ends a route recording; those presses must not toggle the macro.
+        if self.recorder is None and time.monotonic() - self.route_ended_at > ROUTE_HOTKEY_GRACE_S:
+            self.events.put("toggle")
 
     def _toggle(self):
-        if self.controller is None:
+        if self.controller is None or self.recorder is not None:
             return
         self.controller.toggle()
         self.error_text = self.controller.last_error
 
+    def _route_clicked(self):
+        if self.recorder is not None:
+            self.recorder.cancel()
+            return
+        if self.controller is None or self.controller.session is not None:
+            self.footer.setText("Rota, makro dururken kaydedilir.")
+            return
+        try:
+            self.recorder = RouteRecorder(self.cfg.general.hotkey)
+        except PermissionError as e:
+            self.footer.setText(str(e))
+            return
+        self.route_button.setText("Vazgeç")
+        self.start_button.setEnabled(False)
+        self.route_state.setText(f"oyunda {self.cfg.general.hotkey.upper()}'e bas")
+        threading.Thread(target=self._route_thread, args=(self.recorder,), daemon=True, name="route").start()
+
+    def _route_thread(self, recorder):
+        try:
+            events = recorder.record(on_start=lambda: self.events.put(("route", "started")))
+        finally:
+            recorder.close()
+        self.events.put(("route", events))
+
+    def _route_event(self, payload):
+        if payload == "started":
+            self.route_state.setText("kaydediliyor…")
+            return
+        self.recorder = None
+        self.route_ended_at = time.monotonic()
+        self.route_button.setText("Kaydet")
+        self.start_button.setEnabled(self.controller is not None)
+        if payload:
+            save_route(STATE_DIR / ROUTE_FILE, payload)
+            self.log(f"route: saved {len(payload)} key events ({payload[-1][0]:.1f} s)")
+        self._show_route()
+
     def _tick(self):
         while not self.events.empty():
-            self.events.get_nowait()
-            self._toggle()
+            event = self.events.get_nowait()
+            if event == "toggle":
+                self._toggle()
+            else:
+                self._route_event(event[1])
         while not self.log_lines.empty():
             self.logview.appendPlainText(self.log_lines.get_nowait())
         if self.controller is not None:
@@ -444,11 +518,14 @@ class Window(QWidget):
             "totem": "Totem kullanılıyor",
             "potions": "İksir içiliyor",
             "aquarium": "Akvaryum besleniyor",
+            "recovery": "Bağlantı koptu: Sober yeniden açılıp Fisch'e giriliyor",
             "idle": "Bekliyor",
         }.get(phase, phase)
 
     def closeEvent(self, event):
         self.timer.stop()
+        if self.recorder is not None:
+            self.recorder.cancel()
         if self.save_timer.isActive():
             self.save_timer.stop()
             self._save()
@@ -462,6 +539,10 @@ def _turkish_error(text):
         return "Sober penceresi bulunamadı. Oyunu açıp tekrar Başlat'a bas."
     if "closed" in text:
         return "Oyun penceresi kapandı."
+    if "error prompt" in text:
+        return "Roblox bağlantı hatası verdi."
+    if text.startswith("Could not get back"):
+        return "Sober üç denemede Fisch'e geri giremedi."
     return f"Durdu: {text}"
 
 

@@ -19,6 +19,7 @@ KEYCODES = {
     "esc": 1, "escape": 1, "tab": 15, "enter": 28, "return": 28, "space": 57, "backspace": 14,
     "leftshift": 42, "shift": 42, "leftctrl": 29, "ctrl": 29, "leftalt": 56, "alt": 56,
     "pause": 119, "home": 102, "end": 107, "insert": 110, "delete": 111, "f11": 87, "f12": 88,
+    "up": 103, "left": 105, "right": 106, "down": 108,
 }
 KEYCODES.update({f"f{n}": 58 + n for n in range(1, 11)})
 KEYCODES.update({str(n): 1 + n for n in range(1, 10)})
@@ -42,7 +43,7 @@ ABS_MAX = 32767
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
 BUS_USB, BUS_VIRTUAL = 0x03, 0x06
 
-_INPUT_EVENT = struct.Struct("llHHi")
+INPUT_EVENT = struct.Struct("llHHi")
 
 
 def _iow(nr, size):
@@ -82,8 +83,8 @@ class _UInputDevice:
         fcntl.ioctl(self.fd, UI_DEV_CREATE)
 
     def emit(self, *events):
-        buf = b"".join(_INPUT_EVENT.pack(0, 0, t, c, v) for t, c, v in events)
-        os.write(self.fd, buf + _INPUT_EVENT.pack(0, 0, EV_SYN, SYN_REPORT, 0))
+        buf = b"".join(INPUT_EVENT.pack(0, 0, t, c, v) for t, c, v in events)
+        os.write(self.fd, buf + INPUT_EVENT.pack(0, 0, EV_SYN, SYN_REPORT, 0))
 
     def close(self):
         if self.fd is not None:
@@ -138,6 +139,13 @@ class VirtualInput:
         time.sleep(hold_s)
         self.key(name, False)
 
+    def release_key(self, name):
+        code = keycode(name)
+        with self._lock:
+            if code in self._held_keys:
+                self.keyboard.emit((EV_KEY, code, 0))
+                self._held_keys.discard(code)
+
     def release_all(self):
         with self._lock:
             for b in list(self._held_buttons):
@@ -176,26 +184,32 @@ def _keyboard_event_paths():
     return paths
 
 
+def open_keyboards():
+    """Non-blocking read fds of every real keyboard; the devices are not grabbed."""
+    fds = []
+    for path in _keyboard_event_paths():
+        try:
+            fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+    if not fds:
+        raise PermissionError("Cannot read any keyboard in /dev/input. Add your user to the 'input' group "
+                              "(sudo usermod -aG input $USER) and log in again.")
+    return fds
+
+
 class HotkeyListener(threading.Thread):
     """Calls on_press(key_name) when one of `keys` is pressed on any keyboard,
-    whichever window is focused. Does not grab the devices."""
+    whichever window is focused."""
 
     def __init__(self, keys, on_press):
         super().__init__(daemon=True, name="hotkeys")
         self.codes = {keycode(k): k for k in keys}
         self.on_press = on_press
-        self.fds = []
-        for path in _keyboard_event_paths():
-            try:
-                self.fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
-            except OSError:
-                pass
-        if not self.fds:
-            raise PermissionError("Cannot read any keyboard in /dev/input. Add your user to the 'input' group "
-                                  "(sudo usermod -aG input $USER) and log in again.")
+        self.fds = open_keyboards()
 
     def run(self):
-        size = _INPUT_EVENT.size
+        size = INPUT_EVENT.size
         while self.fds:
             ready, _, _ = select.select(self.fds, [], [])
             for fd in ready:
@@ -207,6 +221,6 @@ class HotkeyListener(threading.Thread):
                     self.fds.remove(fd)  # keyboard unplugged
                     continue
                 for off in range(0, len(data) - size + 1, size):
-                    _, _, etype, code, value = _INPUT_EVENT.unpack_from(data, off)
+                    _, _, etype, code, value = INPUT_EVENT.unpack_from(data, off)
                     if etype == EV_KEY and value == 1 and code in self.codes:
                         self.on_press(self.codes[code])

@@ -37,4 +37,6 @@ def summary(stats):
         parts.append(f"{stats.potion_rounds} potion rounds")
     if stats.aquarium_sweeps:
         parts.append(f"{stats.aquarium_sweeps} aquarium feeds")
+    if stats.rejoins:
+        parts.append(f"{stats.rejoins} rejoins")
     return f"{', '.join(parts)} in {minutes // 60} h {minutes % 60} min"

@@ -15,20 +15,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Shake (fisch_vision.lua / fisch_data.lua). Radii are client pixels at a
-# 900 px tall client and scale with the frame height.
-SHAKE_ROI = (0.10, 0.22, 0.80, 0.66)
-SHAKE_CIRCLE_MIN_R = 28
-SHAKE_CIRCLE_MAX_R = 80
-SHAKE_CIRCLE_PARAM1 = 100       # Canny high threshold
-SHAKE_CIRCLE_PARAM2 = 35        # accumulator threshold; lower = more circles
-SHAKE_CIRCLE_MIN_WHITE = 150    # near-white pixels required inside the circle
-SHAKE_WHITE_THRESH = 200
-SHAKE_TEMPLATE_THRESH = 0.65
-SHAKE_MISS_FULLFRAME_S = 0.6    # full-frame template sweep cadence on the miss path
-SHAKE_LOCAL_MARGIN = 1.6        # half-size, in max radii, of the first search box around the last button
-SHAKE_TEMPLATE_AFTER_S = 1.0    # template fallbacks only once the circle detector has lost the button this long
-REFERENCE_CLIENT_H = 900
+# Shake: the SHAKE wordmark on the round button. Its height is a fixed share
+# of the client height (43 px at 1080, measured in Sober); until a confident
+# match pins the real size, sizes around that are tried. Matching runs at
+# half resolution.
+SHAKE_ROI = (0.04, 0.10, 0.92, 0.82)
+SHAKE_WORD_H = 43 / 1080
+SHAKE_SIZE_STEPS = (0.88, 1.0, 1.12)
+SHAKE_MATCH_SCALE = 0.5
+SHAKE_THRESH = 0.55             # real buttons score 0.65-0.9 at half resolution, anything else under 0.45
+SHAKE_PIN_THRESH = 0.70         # a match this good fixes the wordmark size for that client height
 
 # HUD status icons, bottom-right quadrant.
 STATUS_ROI = (0.55, 0.50, 0.45, 0.48)
@@ -83,77 +79,50 @@ def best_match(gray, templates):
 
 
 class ShakeDetector:
+    """Finds the SHAKE button by its wordmark alone. ExoPanda's primary
+    locator (HoughCircles plus a near-white pixel count) also accepts the
+    bobber and bright scenery in Sober, and clicking those does nothing."""
+
     def __init__(self, template_root):
-        self.templates = load_gray_templates(Path(template_root) / "shake")
-        self._last_full_sweep = float("-inf")
-        self._last_circle_t = float("-inf")
-        self.last_method = None
+        self.sources = load_gray_templates(Path(template_root) / "shake")
+        self._sized = {}        # (client height, size factor) -> templates at match scale
+        self._pinned = {}       # client height -> size factor of a confident match
+        self.last_score = None
 
-    def _find_circle(self, roi_rgb, scale):
-        gray = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
-        min_r = max(4, round(SHAKE_CIRCLE_MIN_R * scale))
-        max_r = max(min_r + 1, round(SHAKE_CIRCLE_MAX_R * scale))
-        circles = cv2.HoughCircles(
-            cv2.medianBlur(gray, 5), cv2.HOUGH_GRADIENT, dp=1, minDist=min_r * 2,
-            param1=SHAKE_CIRCLE_PARAM1, param2=SHAKE_CIRCLE_PARAM2, minRadius=min_r, maxRadius=max_r,
-        )
-        if circles is None:
-            return None
-        white = np.all(roi_rgb > SHAKE_WHITE_THRESH, axis=2).astype(np.uint8)
-        min_white = SHAKE_CIRCLE_MIN_WHITE * scale * scale
-        best = None
-        for cx, cy, r in circles[0]:
-            cx, cy, r = int(cx), int(cy), int(r)
-            x0, y0 = max(0, cx - r), max(0, cy - r)
-            patch = white[y0:cy + r + 1, x0:cx + r + 1]
-            disk = np.zeros_like(patch)
-            cv2.circle(disk, (cx - x0, cy - y0), r, 1, -1)
-            count = int(np.count_nonzero(patch & disk))
-            if count >= min_white and (best is None or count > best[2]):
-                best = (float(cx), float(cy), count)
-        return None if best is None else best[:2]
+    def _templates(self, client_h, factor):
+        key = (client_h, factor)
+        if key not in self._sized:
+            h = SHAKE_WORD_H * client_h * factor * SHAKE_MATCH_SCALE
+            self._sized[key] = [
+                cv2.resize(t, (max(1, round(t.shape[1] * h / t.shape[0])), max(1, round(h))), interpolation=cv2.INTER_AREA)
+                for t in self.sources
+            ]
+        return self._sized[key]
 
-    def _find_template(self, rgb):
-        hit = best_match(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), self.templates)
-        if hit is None or hit[0] < SHAKE_TEMPLATE_THRESH:
-            return None
-        score, x, y, w, h = hit
-        return x + w / 2, y + h / 2
-
-    def find(self, frame, first_look, now, near=None):
-        """Shake button centre (frame px) or None. The circle detector looks
-        around `near` (the last button) first, then over the lower-centre ROI.
-        The wordmark template runs only once circles have been missing for
-        SHAKE_TEMPLATE_AFTER_S: right after a click the button is respawning,
-        and a slow fallback would only delay seeing it again. Until the first
-        click of a cast (`first_look`) every miss also sweeps the whole frame;
-        afterwards that sweep runs at most every SHAKE_MISS_FULLFRAME_S."""
-        scale = frame.shape[0] / REFERENCE_CLIENT_H
-        self.last_method = "circle"
-        if near is not None:
-            half = round(SHAKE_CIRCLE_MAX_R * scale * SHAKE_LOCAL_MARGIN)
-            x0, y0 = max(0, round(near[0]) - half), max(0, round(near[1]) - half)
-            hit = self._find_circle(frame[y0:y0 + 2 * half, x0:x0 + 2 * half], scale)
-            if hit is not None:
-                self._last_circle_t = now
-                return x0 + hit[0], y0 + hit[1]
+    def find(self, frame):
+        """Shake button centre (frame px) or None; `last_score` keeps the best correlation."""
+        client_h = frame.shape[0]
         rx, ry, rw, rh = _roi(frame.shape, SHAKE_ROI)
-        roi = frame[ry:ry + rh, rx:rx + rw]
-        hit = self._find_circle(roi, scale)
-        if hit is not None:
-            self._last_circle_t = now
-            return rx + hit[0], ry + hit[1]
-        if now - self._last_circle_t < SHAKE_TEMPLATE_AFTER_S:
+        gray = cv2.cvtColor(frame[ry:ry + rh, rx:rx + rw], cv2.COLOR_RGB2GRAY)
+        small = cv2.resize(gray, None, fx=SHAKE_MATCH_SCALE, fy=SHAKE_MATCH_SCALE, interpolation=cv2.INTER_AREA)
+        pinned = self._pinned.get(client_h)
+        best = None
+        for factor in (pinned,) if pinned else SHAKE_SIZE_STEPS:
+            for template in self._templates(client_h, factor):
+                th, tw = template.shape
+                if th > small.shape[0] or tw > small.shape[1]:
+                    continue
+                scores = np.nan_to_num(cv2.matchTemplate(small, template, cv2.TM_CCOEFF_NORMED), nan=-1.0, posinf=-1.0, neginf=-1.0)
+                _, score, _, (x, y) = cv2.minMaxLoc(scores)
+                if best is None or score > best[0]:
+                    best = (score, x + tw / 2, y + th / 2, factor)
+        self.last_score = None if best is None else best[0]
+        if best is None or best[0] < SHAKE_THRESH:
             return None
-        hit = self._find_template(roi)
-        self.last_method = "template"
-        if hit is not None:
-            return rx + hit[0], ry + hit[1]
-        if first_look or now - self._last_full_sweep >= SHAKE_MISS_FULLFRAME_S:
-            self._last_full_sweep = now
-            self.last_method = "full-frame template"
-            return self._find_template(frame)
-        return None
+        score, x, y, factor = best
+        if pinned is None and score >= SHAKE_PIN_THRESH:
+            self._pinned[client_h] = factor
+        return rx + x / SHAKE_MATCH_SCALE, ry + y / SHAKE_MATCH_SCALE
 
 
 class CycleDetector:

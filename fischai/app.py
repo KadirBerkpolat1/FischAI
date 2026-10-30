@@ -99,7 +99,7 @@ class Session:
     """One start/stop cycle of the macro: window lookup, focus watcher,
     detector thread and the fishing loop."""
 
-    def __init__(self, cfg, model, vision, io, log, on_exit):
+    def __init__(self, cfg, model, vision, io, log, notify, on_exit):
         from .detector import AiBridge, DetectionRegion
         from .macro import Macro, MacroRunner, Stats
 
@@ -114,7 +114,7 @@ class Session:
         self.bridge = AiBridge(model, lambda: self.macro.rect if self.macro else win.rect,
                                self.region, cfg.reel, IDLE_DETECT_FPS, log)
         self.macro = Macro(cfg, win, io, self.focus, self.bridge, vision, STATE_DIR, log,
-                           self._set_status, self.stop_event, self.stats)
+                           self._set_status, notify, self.stop_event, self.stats)
         self.runner = MacroRunner(self.macro, on_exit)
 
     def _set_status(self, phase, detail):
@@ -164,7 +164,8 @@ class Controller:
         if self.session is not None:
             return True
         try:
-            self.session = Session(self.cfg, self.model, self.vision, self.io, self.log, self._exited.put)
+            self.session = Session(self.cfg, self.model, self.vision, self.io, self.log,
+                                   lambda text: self._webhook.send(text), self._exited.put)
         except hypr.WindowError as e:
             self.last_error = str(e)
             self.log(self.last_error)
