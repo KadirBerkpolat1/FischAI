@@ -245,6 +245,12 @@ class Window(QWidget):
         self._section("Discord")
         self._text("Webhook adresi", c.webhook, "url", "https://discord.com/api/webhooks/…")
         self._slider("Özet aralığı", c.webhook, "summary_min", 5, 240, 5, "dk")
+
+        self._section("Sorun bildirme")
+        folder = str(STATE_DIR / "debug").replace(str(Path.home()), "~", 1)
+        self._switch("Ne gördüğünü kaydet", c.general, "debug_snapshots",
+                     hint=f"Her tıklamada ve aşama değişiminde gördüğü kareyi, tıkladığı yer işaretli olarak "
+                          f"{folder} içine kaydeder (en fazla 400 görüntü).")
         self.grid.setRowStretch(self.row, 1)
         return page
 

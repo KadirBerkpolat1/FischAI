@@ -9,6 +9,7 @@ focus: losing it pauses the loop and releases every held button and key.
 """
 
 import math
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ DUAL_ENTRY_MIN_CONF = 0.45
 ENTRY_DEBOUNCE_TICKS = 2
 SHAKE_TO_REEL_HINT_TICKS = 3
 MIN_COUNTED_REEL_S = 1.5        # shorter "reels" are detector blips, not catches
+NO_SHAKE_AFTER_CAST_S = 7.0     # no shake button at all this long after a cast: the cast did not land
+MAX_SNAPSHOTS = 400
 
 REEL_TICK_S = 0.016
 SHAKE_TICK_S = 0.008
@@ -173,6 +176,39 @@ class Pointer:
         self.io.button(True)
         time.sleep(hold_s)
         self.io.button(False)
+
+
+class Snapshots:
+    """Debug evidence: the frame a decision was made on, marked up and
+    written as JPEG by a background thread. Keeps the newest MAX_SNAPSHOTS."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.queue = queue.Queue(maxsize=16)
+        threading.Thread(target=self._write_loop, daemon=True, name="snapshots").start()
+
+    def save(self, name, frame, points=(), rects=()):
+        try:
+            self.queue.put_nowait((time.time(), name, frame, points, rects))
+        except queue.Full:
+            pass
+
+    def _write_loop(self):
+        import cv2
+        self.folder.mkdir(parents=True, exist_ok=True)
+        while True:
+            stamp, name, frame, points, rects = self.queue.get()
+            image = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            for x, y, w, h in rects:
+                cv2.rectangle(image, (round(x), round(y)), (round(x + w), round(y + h)), (0, 220, 255), 2)
+            for x, y in points:
+                cv2.drawMarker(image, (round(x), round(y)), (0, 0, 255), cv2.MARKER_CROSS, 44, 3)
+            image = cv2.resize(image, (image.shape[1] * 2 // 3, image.shape[0] * 2 // 3), interpolation=cv2.INTER_AREA)
+            ms = int(stamp * 1000) % 1000
+            path = self.folder / f"{time.strftime('%H%M%S', time.localtime(stamp))}.{ms:03d}-{name}.jpg"
+            cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            for old in sorted(self.folder.glob("*.jpg"))[:-MAX_SNAPSHOTS]:
+                old.unlink(missing_ok=True)
 
 
 class ReelTelemetry:
@@ -348,6 +384,8 @@ class Macro:
         self.pointer = Pointer(self.io)
         self.shaker = Shaker(self.io, self.pointer, log)
         self.world = WorldState(self.grab_window, vision.cycle, vision.weather_event)
+        self.state_dir = state_dir
+        self.snapshots = None
         self.aquarium_timer = state_dir / "aquarium_next_run"
         self.potion_timer = state_dir / "potions_last_use"
         self.aquarium_misses = 0
@@ -361,7 +399,8 @@ class Macro:
         self.cast_t = -math.inf
         self.shake_last_hit = None
         self.shake_last_hit_t = -math.inf
-        self.reel_last_live = -math.inf
+        self.last_bar_seen = -math.inf
+        self.last_fish_seen = -math.inf
         self.consec_fish = 0
         self.shake_hint_frames = 0
         self.shake_clicked_this_cast = False
@@ -398,6 +437,23 @@ class Macro:
     def _mark_activity(self):
         self.last_activity = time.monotonic()
 
+    def _snap(self, name, frame=None, points=(), with_boxes=False):
+        """Debug snapshot of what the macro is acting on, when enabled."""
+        if not self.cfg.general.debug_snapshots:
+            return
+        if self.snapshots is None:
+            self.snapshots = Snapshots(self.state_dir / "debug" / time.strftime("%Y%m%d-%H%M%S"))
+        if frame is None:
+            frame = self.grab_window()
+        rects = []
+        if with_boxes:
+            ox, oy = self.win.x, self.win.y
+            rx, ry, rw, rh = self.bridge.region.rect(self.rect)
+            rects.append((rx - ox, ry - oy, rw, rh))
+            boxes = self.bridge.latest
+            rects += [(b.x - ox, b.y - oy, b.w, b.h) for b in (boxes.bar, boxes.fish) if b is not None]
+        self.snapshots.save(name, frame, points, rects)
+
     def _equip_rod(self, full):
         presses = (OTHER_SLOT, ROD_SLOT, OTHER_SLOT, ROD_SLOT) if full else (OTHER_SLOT, ROD_SLOT)
         for key in presses:
@@ -406,6 +462,7 @@ class Macro:
         self.last_equip = time.monotonic()
 
     def _end_reel(self, now, why):
+        self._snap("reel-end", with_boxes=True)
         self.reeling = False
         self.reeler.reset(now)
         self.shaker.reset()
@@ -428,6 +485,7 @@ class Macro:
         # on few positions means the clicks are not landing.
         self.log(f"reel: {how} after {self.cast_shake_clicks} shake click(s) on "
                  f"{len(self.shaker.spots)} button position(s){since_cast}")
+        self._snap("reel-start", with_boxes=True)
 
     # -- main loop -------------------------------------------------------------
 
@@ -475,10 +533,17 @@ class Macro:
         self._refresh_window(now)
         boxes = self.bridge.latest
         fresh = now - boxes.frame_t < STALE_S
-        box_live = fresh and (boxes.bar is not None or boxes.fish is not None)
+        if fresh and boxes.bar is not None:
+            self.last_bar_seen = now
+        if fresh and boxes.fish is not None:
+            self.last_fish_seen = now
+        both_now = fresh and boxes.bar is not None and boxes.fish is not None
 
         # Reel entry: STRICT to start (a debounced or confident fish box, or both
-        # classes at once), LOOSE to stay (any box within the holdover window).
+        # classes at once). Staying needs both classes within the holdover
+        # window: ExoPanda stayed on any single box, but in Fisch a lone box is
+        # far more often on-screen text than a reel that lost one class (real
+        # reels show both in ~96% of frames).
         fish_now = fresh and boxes.fish is not None and boxes.fish.conf >= ENTRY_MIN_FISH_CONF
         enter_strict = False
         if fish_now:
@@ -487,9 +552,8 @@ class Macro:
             enter_strict = dual or self.consec_fish >= ENTRY_DEBOUNCE_TICKS or boxes.fish.conf >= ENTRY_FAST_FISH_CONF
         else:
             self.consec_fish = 0
-        if box_live:
-            self.reel_last_live = now
-        stay_reel = self.reeling and now - self.reel_last_live < HOLDOVER_S
+        stay_reel = (self.reeling and now - self.last_bar_seen < HOLDOVER_S
+                     and now - self.last_fish_seen < HOLDOVER_S)
         reel_live = stay_reel or enter_strict
 
         if self.phase == "reel" or reel_live:
@@ -507,7 +571,8 @@ class Macro:
             self.sleep(REEL_TICK_S)
         elif self.phase == "shake":
             self.bridge.active = True
-            self._shake_step(now, fish_now or box_live, box_live)
+            reel_hint = both_now and boxes.bar.conf >= DUAL_ENTRY_MIN_CONF
+            self._shake_step(now, fish_now or both_now, reel_hint)
             self.sleep(SHAKE_TICK_S)
         else:
             self.bridge.active = False
@@ -526,18 +591,17 @@ class Macro:
             parts.append(f"fish {boxes.fish.conf:.2f}")
         return " ".join(parts) or "holding"
 
-    def _shake_step(self, now, suppress, box_live):
+    def _shake_step(self, now, suppress, reel_hint):
         self.reeling = False
-        # A reel box that persists while still in the shake phase means the
+        # Both reel classes persisting while still in the shake phase means the
         # strict entry under-detected the reel: hand over instead of waiting
         # for the 16 s watchdog to recast mid-reel.
-        self.shake_hint_frames = self.shake_hint_frames + 1 if box_live else 0
+        self.shake_hint_frames = self.shake_hint_frames + 1 if reel_hint else 0
         if self.shake_hint_frames >= SHAKE_TO_REEL_HINT_TICKS:
             self.shake_hint_frames = 0
-            self.reel_last_live = now
             self._start_reel(now, "entered from a persistent box during shake")
             return
-        hit = None
+        hit = frame = None
         if self.cfg.fishing.auto_shake:
             frame = self.grab_window()
             near = self.shake_last_hit if now - self.shake_last_hit_t < SHAKE_NEAR_S else None
@@ -551,11 +615,17 @@ class Macro:
                 self.stats.shake_clicks += 1
                 self.cast_shake_clicks += 1
                 self.status("shake", f"clicked ({self.vision.shake.last_method})")
+                self._snap("shake", frame, [hit])
+        elif self.cfg.fishing.auto_shake and not self.shake_clicked_this_cast \
+                and now - self.cast_t > NO_SHAKE_AFTER_CAST_S:
+            self.log(f"shake: no button {NO_SHAKE_AFTER_CAST_S:.0f} s after the cast, casting again")
+            result = "timeout"
         else:
             result = self.shaker.wait(now)
             if result == "waiting":
                 self.status("shake", "waiting for the button")
         if result == "timeout":
+            self._snap("shake-timeout", frame)
             self.stats.shake_timeouts += 1
             self.waiting_for_bite = False
             self.recast_anchor = None
@@ -585,6 +655,7 @@ class Macro:
 
     def _cast(self):
         self.status("cast", "casting")
+        self._snap("cast")
         x, y = self.win.center
         self.pointer.warp(x, y)
         self.io.button(True)

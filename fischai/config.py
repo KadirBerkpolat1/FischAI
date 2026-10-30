@@ -27,6 +27,7 @@ TEMPLATE = """\
 [general]
 hotkey = {general_hotkey}          # start / stop
 window = {general_window}          # window class, or a title substring
+debug_snapshots = {general_debug_snapshots}  # save what the macro saw at each click and phase change
 
 [fishing]
 auto_cast = {fishing_auto_cast}
@@ -70,6 +71,7 @@ summary_min = {webhook_summary_min}
 class General:
     hotkey: str = "f3"
     window: str = "org.vinegarhq.Sober"
+    debug_snapshots: bool = False
 
 
 @dataclass
