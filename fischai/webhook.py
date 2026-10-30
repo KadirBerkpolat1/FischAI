@@ -6,6 +6,8 @@ import time
 import urllib.error
 import urllib.request
 
+from .config import CAST_GRADES
+
 
 class Webhook:
     def __init__(self, settings, log):
@@ -29,8 +31,9 @@ class Webhook:
 def summary(stats):
     minutes = int((time.time() - stats.started) // 60)
     parts = [f"{stats.reels} reels", f"{stats.casts} casts"]
-    if stats.perfect_casts:
-        parts.append(f"{stats.perfect_casts} perfect casts")
+    if stats.cast_grades:
+        graded = ", ".join(f"{stats.cast_grades[g]} {g}" for g in reversed(CAST_GRADES) if g in stats.cast_grades)
+        parts.append(f"casts graded {graded}")
     if stats.shake_timeouts:
         parts.append(f"{stats.shake_timeouts} casts without a bite")
     if stats.totems:

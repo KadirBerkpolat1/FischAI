@@ -54,6 +54,9 @@ SAVE_DELAY_MS = 600
 LOG_LINES = 300
 ROUTE_HOTKEY_GRACE_S = 1.0
 
+CAST_GRADE_CHOICES = (("meh", "Meh"), ("fine", "Fine"), ("good", "Good"),
+                      ("great", "Great"), ("amazing", "Amazing"), ("perfect", "Perfect"))
+
 # The fishing cycle shown at the top; idle-chain phases count as casting.
 STEPS = ("Atış", "Shake", "Çekme")
 STEP_OF_PHASE = {"starting": 0, "cast": 0, "idle": 0, "totem": 0, "potions": 0, "aquarium": 0, "shake": 1, "reel": 2}
@@ -95,6 +98,8 @@ def stylesheet(p, ui_font, log_font):
     QPushButton#primary:disabled {{ background: {p['surfaceContainerHigh']}; color: {p['outline']}; }}
     QPushButton#segment {{ border-radius: 0; padding: 5px 14px; color: {p['onSurfaceVariant']}; }}
     QPushButton#segment:checked {{ background: {p['primary']}; color: {p['onPrimary']}; }}
+    QPushButton#segment-wide {{ border-radius: 0; padding: 5px 4px; min-width: 0; color: {p['onSurfaceVariant']}; }}
+    QPushButton#segment-wide:checked {{ background: {p['primary']}; color: {p['onPrimary']}; }}
     QSlider::groove:horizontal {{ height: 4px; background: {p['outlineVariant']}; border-radius: 2px; }}
     QSlider::sub-page:horizontal {{ background: {p['primary']}; border-radius: 2px; }}
     QSlider::handle:horizontal {{ background: {p['onSurface']}; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}
@@ -220,9 +225,11 @@ class Window(QWidget):
                      hint="Shake düğmesini, reel çubuğunu ve güç çubuğunu oyunun belleğinden okur "
                           "(yalnız okur, bir şey yazmaz). Okuyamazsa ya da kapalıyken her şey ekrandan.")
         self._switch("Oltayı kendisi atsın", c.fishing, "auto_cast")
-        self._switch("Perfect cast", c.fishing, "perfect_cast",
-                     hint="Güç çubuğunu izler, dolgu yeşil işarete gelince bırakır. Çubuk görünmezse "
-                          "aşağıdaki süre kadar basılı tutar.")
+        self._choice("Atış derecesi", c.fishing, "cast_grade", CAST_GRADE_CHOICES, wide=True)
+        self.grid.addWidget(QLabel("Güç çubuğu seçilen dereceyi verecek kadar dolunca bırakır; daha düşük derece "
+                                   "oltayı daha yakına atar. Çubuk okunamazsa aşağıdaki süre kadar basılı tutar.",
+                                   objectName="hint", wordWrap=True), self.row, 0, 1, 3)
+        self.row += 1
         self._slider("Atışta basılı tutma", c.fishing, "cast_hold_ms", 100, 2000, 50, "ms")
         self._slider("Yakaladıktan sonra bekleme", c.fishing, "recast_delay_ms", 100, 5000, 100, "ms")
         self._switch("Shake'e kendisi bassın", c.fishing, "auto_shake")
@@ -349,21 +356,28 @@ class Window(QWidget):
         wrapper.setLayout(holder)
         self._place("Slotlar", wrapper, hint="Her slottaki iksir sırayla içilir, sonra olta 1. slota geri alınır.")
 
-    def _choice(self, label, target, attr, options):
+    def _choice(self, label, target, attr, options, wide=False):
+        """Segmented buttons; `wide` puts them on their own full-width row under the label."""
         holder = QHBoxLayout()
         holder.setContentsMargins(0, 0, 0, 0)
         holder.setSpacing(0)
-        holder.addStretch(1)
+        if not wide:
+            holder.addStretch(1)
         group = QButtonGroup(self)
         for key, text in options:
-            button = QPushButton(text, objectName="segment", checkable=True)
+            button = QPushButton(text, objectName="segment-wide" if wide else "segment", checkable=True)
             button.setChecked(getattr(target, attr) == key)
             button.clicked.connect(lambda _c, key=key: self._set(target, attr, key))
             group.addButton(button)
-            holder.addWidget(button)
+            holder.addWidget(button, 1 if wide else 0)
         wrapper = QWidget()
         wrapper.setLayout(holder)
-        self._place(label, wrapper)
+        if not wide:
+            self._place(label, wrapper)
+            return
+        self.grid.addWidget(QLabel(label), self.row, 0, 1, 3)
+        self.grid.addWidget(wrapper, self.row + 1, 0, 1, 3)
+        self.row += 2
 
     def _text(self, label, target, attr, placeholder):
         edit = QLineEdit(getattr(target, attr), placeholderText=placeholder)
@@ -493,8 +507,9 @@ class Window(QWidget):
         if running:
             s = session.stats
             minutes = int((time.time() - s.started) // 60)
-            perfect = f" ({s.perfect_casts} perfect)" if self.cfg.fishing.perfect_cast else ""
-            self.counters.setText(f"{s.reels} balık    {s.casts} atış{perfect}    {minutes} dk    "
+            grade = self.cfg.fishing.cast_grade
+            hits = f" ({s.cast_grades.get(grade, 0)} {dict(CAST_GRADE_CHOICES)[grade]})"
+            self.counters.setText(f"{s.reels} balık    {s.casts} atış{hits}    {minutes} dk    "
                                   f"algılama {session.bridge.frame_ms:.0f} ms")
         else:
             self.counters.setText(f"Kısayol: oyundayken {self.cfg.general.hotkey.upper()}")

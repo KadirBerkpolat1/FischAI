@@ -16,6 +16,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .config import CAST_GRADES
+
 # Shake: the SHAKE wordmark on the round button, 43 px tall at a 1080 px
 # client (measured in Sober). The button pops in and wobbles when clicked,
 # so its size varies (0.7-1.06x in a recording) and every frame tries a few
@@ -29,25 +31,29 @@ SHAKE_MATCH_SCALE = 0.5
 SHAKE_THRESH = 0.60             # recorded buttons mostly 0.6-0.93; static scenery up to 0.57
 SHAKE_EXCLUDE_PX = 40           # radius around a spot the macro gave up on
 
-# Cast power bar: a dark vertical bar right of the character with a thin
-# green marker on top. While the button is held the fill rises from the
-# bottom, reaches the marker ~0.45 s after the bar shows, falls back and
-# rises again; PERFECT needs the fill inside the marker on release. Measured
-# in Sober at 1880x998: bar column x 1076-1083, marker y ~425, bottom y ~646.
+# Cast power bar: an 8 px wide, ~212 px tall bar right of the character with
+# a green marker at its top. While the button is held a white fill rises from
+# the bottom, reaches the top, falls back and rises again; how full it is when
+# the release lands sets the cast's grade. The empty part is a translucent
+# blue tint, dark by night and light by day, so the fill is told by its own
+# colour and by differing from the background beside the bar. Measured in
+# Sober at 1880x998 by night and by day.
 POWER_ROI = (0.48, 0.25, 0.24, 0.50)        # x, y, w, h as fractions of the client
 POWER_GREEN_HSV = ((35, 110, 90), (85, 255, 255))
 POWER_MARKER_W = (6, 48)                    # px: a short, thin horizontal line
 POWER_MARKER_H = (2, 10)
-POWER_HALF_W = 3                            # half-width of the column read under the marker
-POWER_EMPTY_MAX_V = 95                      # the empty bar is dark (V 55-77) whatever is behind it
-POWER_FILL_MIN_V = 110                      # the fill is whitish (low saturation), V ~120-195
-POWER_FILL_MAX_S = 80
-POWER_SCAN = 0.30                           # how far below the marker the fill is read, share of the client height
+POWER_HALF_W = 2                            # half-width of the column read in the middle of the bar
+POWER_SIDE_PX = (9, 13)                     # the background beside the bar, this far from its middle
+POWER_FILL_MAX_S = 30                       # the fill is near white (S 11-12, V 217-231); the empty
+POWER_FILL_MIN_V = 170                      # bar has S 50-80, clouds below the bar V ~160
+POWER_FILL_CONTRAST = 20                    # the fill differs from both sides by 44+, clouds by up to 12
+POWER_BAR_ROWS = (160, 265)                 # the fill ends at the bar's bottom, ~212 rows below the marker's top
+POWER_FILL_GAP = 3                          # rows a fill may skip and still be one fill
+POWER_SCENERY_PX = 6                        # a green blob this close to one seen before the press is scenery
 
 # The cast's grade ("Meh..", "Fine.", "Good!", "Great!", "Amazing!!",
 # "PERFECT!") is written over the character for about a second.
 CAST_TEXT_ROI = (0.38, 0.28, 0.24, 0.18)
-CAST_GRADES = ("perfect", "amazing", "great", "good", "fine", "meh")
 
 # HUD status icons, bottom-right quadrant.
 STATUS_ROI = (0.55, 0.50, 0.45, 0.48)
@@ -151,13 +157,12 @@ class ShakeDetector:
 
 class PowerBar:
     """Reads the cast power bar from crops of POWER_ROI (see `crop`), one cast
-    at a time: find_marker() until the bar shows, then gap() per frame. In
-    Sober a release at gap <= 3 px graded PERFECT 3 times out of 3: the
-    fill keeps rising into the marker while the release reaches the game."""
+    at a time, with fill() on every frame. `before` is a crop taken before the
+    press: green marker-like blobs already in it are scenery."""
 
-    def __init__(self, client_h):
-        self.scan = round(POWER_SCAN * client_h)
-        self.marker = None      # (column x, marker top y, marker bottom y) in crop px
+    def __init__(self, before=None):
+        self.marker = None      # (column x, marker top y) in crop px, where the bar was last found
+        self.scenery = [] if before is None else [(x, y) for x, y, _ in self._markers(before)]
 
     @staticmethod
     def crop(win_rect):
@@ -166,34 +171,57 @@ class PowerBar:
         fx, fy, fw, fh = POWER_ROI
         return round(x + fx * w), round(y + fy * h), round(fw * w), round(fh * h)
 
-    def find_marker(self, rgb):
-        """The green marker with the dark empty bar under it, or None."""
+    @staticmethod
+    def _markers(rgb):
+        """(middle x, top y, bottom y) of every marker-shaped green blob."""
         green = cv2.inRange(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV), *POWER_GREEN_HSV)
         n, _, stats, _ = cv2.connectedComponentsWithStats(green)
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        best = None
-        for x, y, w, h, _area in stats[1:n]:
-            if not (POWER_MARKER_W[0] <= w <= POWER_MARKER_W[1] and POWER_MARKER_H[0] <= h <= POWER_MARKER_H[1]):
-                continue
-            cx = int(x + w // 2)
-            below = gray[y + h + 3:y + h + 30, max(0, cx - POWER_HALF_W):cx + POWER_HALF_W + 1]
-            if below.size and below.mean() <= POWER_EMPTY_MAX_V and (best is None or below.mean() < best[0]):
-                best = (below.mean(), cx, int(y), int(y + h))
-        if best is not None:
-            self.marker = best[1:]
-        return self.marker
+        return [(int(x + w // 2), int(y), int(y + h)) for x, y, w, h, _area in stats[1:n]
+                if POWER_MARKER_W[0] <= w <= POWER_MARKER_W[1] and POWER_MARKER_H[0] <= h <= POWER_MARKER_H[1]]
 
-    def gap(self, rgb):
-        """Rows between the marker's bottom and the top of the fill (0 = the
-        fill reaches the marker), or None when no fill is in the scanned part."""
-        cx, top, bottom = self.marker
-        column = rgb[top:bottom + self.scan, max(0, cx - POWER_HALF_W):cx + POWER_HALF_W + 1]
-        hsv = cv2.cvtColor(column, cv2.COLOR_RGB2HSV)
-        filled = ((hsv[..., 2] >= POWER_FILL_MIN_V) & (hsv[..., 1] <= POWER_FILL_MAX_S)).mean(axis=1) > 0.5
-        runs = np.flatnonzero(filled[:-2] & filled[1:-1] & filled[2:])
-        if not runs.size:
+    @staticmethod
+    def _fill_rows(rgb, cx, top):
+        """(first, end) rows of the fill below a marker at (cx, top), counted from
+        the marker's top, when a fill run ends where the bar's bottom can be."""
+        x0, x1 = cx - POWER_SIDE_PX[1], cx + POWER_SIDE_PX[1] + 1
+        if x0 < 0 or x1 > rgb.shape[1]:
             return None
-        return max(0, int(runs[0]) - (bottom - top))
+        strip = rgb[top:top + POWER_BAR_ROWS[1], x0:x1]
+        mid = slice(POWER_SIDE_PX[1] - POWER_HALF_W, POWER_SIDE_PX[1] + POWER_HALF_W + 1)
+        left = slice(0, POWER_SIDE_PX[1] - POWER_SIDE_PX[0] + 1)
+        right = slice(POWER_SIDE_PX[1] + POWER_SIDE_PX[0], 2 * POWER_SIDE_PX[1] + 1)
+        hsv = cv2.cvtColor(strip[:, mid], cv2.COLOR_RGB2HSV).mean(axis=1)
+        gray = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        middle = gray[:, mid].mean(axis=1)
+        fill = ((hsv[:, 1] <= POWER_FILL_MAX_S) & (hsv[:, 2] >= POWER_FILL_MIN_V)
+                & (np.abs(middle - gray[:, left].mean(axis=1)) >= POWER_FILL_CONTRAST)
+                & (np.abs(middle - gray[:, right].mean(axis=1)) >= POWER_FILL_CONTRAST))
+        rows = np.flatnonzero(fill)
+        if not rows.size:
+            return None
+        breaks = np.flatnonzero(np.diff(rows) > POWER_FILL_GAP)
+        first, last = (int(rows[breaks[-1] + 1]) if breaks.size else int(rows[0])), int(rows[-1])
+        end = last + 1
+        return (first, end) if POWER_BAR_ROWS[0] <= end <= POWER_BAR_ROWS[1] else None
+
+    def fill(self, rgb):
+        """How full the bar is (0..1), as the game's memory has it: the fill's
+        height over the bar's, from the marker's top to the fill's bottom.
+        The bar sways with the character, so it is looked for on every frame;
+        near the top the fill covers the marker and its last place is used.
+        None when no bar or no fill shows."""
+        candidates = [(x, y) for x, y, _ in self._markers(rgb)
+                      if not any(abs(x - sx) <= POWER_SCENERY_PX and abs(y - sy) <= POWER_SCENERY_PX
+                                 for sx, sy in self.scenery)]
+        if self.marker is not None:
+            candidates.append(self.marker)
+        for cx, top in candidates:
+            rows = self._fill_rows(rgb, cx, top)
+            if rows is not None:
+                self.marker = (cx, top)
+                first, end = rows
+                return (end - first) / end
+        return None
 
 
 def cast_text_crop(win_rect):

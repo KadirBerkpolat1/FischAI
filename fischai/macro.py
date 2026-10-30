@@ -58,15 +58,28 @@ ROD_SLOT = "1"
 OTHER_SLOT = "2"
 EQUIP_STEP_S = 0.120
 
-# Perfect cast on the power bar (vision.PowerBar).
-CAST_BAR_WAIT_S = 0.5           # the bar shows ~0.14 s after the press
-CAST_MAX_S = 2.0
-CAST_ARM_GAP_PX = 40            # the fill must first be seen this far below the marker
-CAST_PERFECT_GAP_PX = 3         # released here, the fill is inside the marker when the game reads it
-CAST_LATE_GAP_PX = 25           # already falling this close to the top: release now, it only gets worse
+# Casting on the power bar. Fisch grades a cast by how full the bar is when the
+# fill stops, at the first game frame after the release. Read from memory on 26
+# casts: Meh.. up to 0.16, Fine. 0.22-0.39, Good! 0.57, Great! 0.63-0.77,
+# Amazing!! 0.81-0.92, PERFECT! 0.95 and up; the fill turns back down at 1.
+# The release goes out when the rising fill, projected ahead at its speed,
+# would stop in the middle of the chosen grade's band.
+CAST_STOP_AT = {"meh": 0.10, "fine": 0.30, "good": 0.50, "great": 0.70, "amazing": 0.875, "perfect": 1.0}
+CAST_BAR_WAIT_S = 0.5           # the bar shows ~0.1 s after the press
+CAST_MAX_S = 2.0                # the fill rises, falls and rises again in ~1.3 s
+CAST_MEMORY_POLL_S = 0.001
+GAME_FRAME_S = 1 / 60
+CAST_MEMORY_LEAD_S = 1.5 * GAME_FRAME_S     # memory has each frame's fill as it is drawn; it stops at the next one
+CAST_SCREEN_LEAD_S = 0.051      # the screen shows it ~43 ms late, and it stops half a frame after the release
+CAST_SCREEN_READ_S = 0.025      # one screen read; a release due sooner is waited out instead
+CAST_FILL_START_S = 0.085       # the fill starts rising this long after the press,
+CAST_TYPICAL_SPEED = 2.0        # at 1-3 bars per second
+CAST_MAX_SPEED = 4.0
+CAST_SCREEN_FIRST_S = 0.17      # and is not readable on the screen any earlier
 CAST_GRADE_READ_S = 1.4         # the grade text stays up about a second
-CAST_GRADE_POLL_S = 0.1
-CAST_MEMORY_POLL_S = 0.001      # the fill moves ~0.5 px per ms
+CAST_GRADE_POLL_S = 0.1         # OCR
+CAST_GRADE_MEMORY_POLL_S = 0.01
+
 ROD_REEQUIP_INTERVAL_S = 3600
 
 TOTEM_EQUIP_SETTLE_S = 0.65
@@ -296,7 +309,7 @@ class Stats:
     shake_clicks: int = 0
     shake_timeouts: int = 0
     totems: int = 0
-    perfect_casts: int = 0
+    cast_grades: dict = field(default_factory=dict)     # grade -> casts that got it
     potion_rounds: int = 0
     aquarium_sweeps: int = 0
     rejoins: int = 0
@@ -810,17 +823,18 @@ class Macro:
         self._snap("cast")
         x, y = self.win.center
         self.pointer.warp(x, y)
-        bar = PowerBar(self.win.height) if self.cfg.fishing.perfect_cast else None
+        target, ui = self.cfg.fishing.cast_grade, self.ui
+        earlier = ui.grade_labels() if ui else None
+        bar = None if ui else PowerBar(screen.grab(*PowerBar.crop(self.rect)))
         self.io.button(True)
         try:
-            how = self._hold_for_cast(bar)
+            how = self._hold_for_cast(CAST_STOP_AT[target], ui, bar)
         finally:
             self.io.button(False)
         self.stats.casts += 1
-        self.log(f"cast #{self.stats.casts}: {how}")
-        if bar is not None:
-            threading.Thread(target=self._read_cast_grade, args=(self.stats.casts, self.rect),
-                             daemon=True, name="cast-grade").start()
+        self.log(f"cast #{self.stats.casts}: aiming for {target.upper()}, {how}")
+        threading.Thread(target=self._read_cast_grade, args=(self.stats.casts, target, self.rect, ui, earlier),
+                         daemon=True, name="cast-grade").start()
         self.cast_t = time.monotonic()
         self.cast_shake_clicks = 0
         self.waiting_for_bite = True
@@ -829,80 +843,65 @@ class Macro:
         self.shaker.reset()
         self.phase = "shake"
 
-    def _hold_for_cast(self, bar):
-        """Keep the button held until the release, returning how it was timed.
-        With the power bar: release once the rising fill is within
-        CAST_PERFECT_GAP_PX of the green marker. Without it, or when the bar
-        does not show, the timed hold."""
+    def _hold_for_cast(self, stop_at, ui, bar):
+        """Keep the button held until the fill will stop at `stop_at`, read
+        from the game's memory or, without it, from the screen with `bar`, a
+        PowerBar set up before the press. Returns how the release was timed.
+        When no power bar can be read, the timed hold."""
         hold_s = self.cfg.fishing.cast_hold_ms / 1000
         start = time.monotonic()
-        if bar is None:
-            self.sleep(hold_s)
-            return f"held {hold_s:.2f} s"
-        if self.ui is not None:
-            return self._hold_for_cast_memory(start, hold_s)
-        crop = PowerBar.crop(self.rect)
-        armed = seen_fill = False
-        prev = None
+        if ui is not None:
+            read, source, lead, poll = ui.power_fill, "memory", CAST_MEMORY_LEAD_S, CAST_MEMORY_POLL_S
+        else:
+            timed_s = CAST_FILL_START_S + stop_at / CAST_TYPICAL_SPEED - GAME_FRAME_S / 2
+            if timed_s < CAST_SCREEN_FIRST_S:
+                self.sleep(timed_s)
+                return f"held {timed_s:.2f} s, a throw too short to see on the screen"
+            crop = PowerBar.crop(self.rect)
+            read, source, lead, poll = (lambda: bar.fill(screen.grab(*crop))), "screen", CAST_SCREEN_LEAD_S, 0.0
+        horizon = CAST_SCREEN_READ_S if source == "screen" else 0.0
+        last = rise = None              # rise: the fill and time the current rise was first read at
         while True:
             if self.stop_event.is_set():
                 raise Stopped
+            fill = read()
             now = time.monotonic()
             t = now - start
             if t > CAST_MAX_S:
-                return f"held {t:.2f} s, the fill never reached the marker"
-            rgb = screen.grab(*crop)
-            if bar.marker is None and bar.find_marker(rgb) is None:
-                if t >= max(CAST_BAR_WAIT_S, hold_s):
-                    return f"held {t:.2f} s, no power bar seen"
-                continue
-            gap = bar.gap(rgb)
-            if gap is None:
-                if not seen_fill and t >= max(CAST_BAR_WAIT_S, hold_s):
-                    return f"held {t:.2f} s, the power bar's fill was not readable"
-                continue
-            seen_fill = True
-            armed = armed or gap >= CAST_ARM_GAP_PX
-            if armed and (gap <= CAST_PERFECT_GAP_PX or (prev is not None and gap > prev and gap <= CAST_LATE_GAP_PX)):
-                return f"released at {t:.2f} s, {gap} px below the marker"
-            prev = gap
+                return f"held {t:.2f} s, the fill never rose to {stop_at:.0%} ({source})"
+            if fill is None:
+                if last is None and t >= max(CAST_BAR_WAIT_S, hold_s):
+                    return f"held {t:.2f} s, no power bar ({source})"
+            elif fill != last:
+                # Memory keeps the last cast's bar until the new one shows; the screen shows only the new one.
+                if last is not None and last < fill:
+                    speed = min((fill - rise[0]) / (now - rise[1]), CAST_MAX_SPEED)
+                else:
+                    speed = CAST_TYPICAL_SPEED if last is None and source == "screen" else None
+                    rise = (fill, now)
+                wait = (stop_at - fill) / speed - lead if speed else None
+                if wait is not None and wait <= horizon:
+                    if wait > 0:
+                        self.sleep(wait)
+                    return (f"released at {t + max(wait, 0):.2f} s with the bar {fill:.0%} full "
+                            f"rising {speed:.1f}/s ({source})")
+                last = fill
+            if poll:
+                time.sleep(poll)
 
-    def _hold_for_cast_memory(self, start, hold_s):
-        """The same release from the game's memory (ExoPanda's memory rule with
-        the 3 px lead that graded PERFECT on screen): arm once the top of the
-        fill is below the green zone, release when it is back within
-        CAST_PERFECT_GAP_PX of the zone's bottom."""
-        armed = False
-        while True:
-            if self.stop_event.is_set():
-                raise Stopped
-            t = time.monotonic() - start
-            if t > CAST_MAX_S:
-                return f"held {t:.2f} s, the fill never reached the green zone (memory)"
-            bar = self.ui.power_bar()
-            if bar is None:
-                if t >= max(CAST_BAR_WAIT_S, hold_s):
-                    return f"held {t:.2f} s, no power bar in memory"
-            else:
-                top, green_bottom = bar
-                if top > green_bottom + CAST_ARM_GAP_PX:
-                    armed = True
-                elif armed and top <= green_bottom + CAST_PERFECT_GAP_PX:
-                    return f"released at {t:.2f} s, fill {top - green_bottom:.1f} below the green zone (memory)"
-            time.sleep(CAST_MEMORY_POLL_S)
-
-    def _read_cast_grade(self, number, rect):
-        """Log the grade Fisch writes over the character after a cast."""
+    def _read_cast_grade(self, number, target, rect, ui, earlier):
+        """Log the grade Fisch writes over the character after a cast, read
+        from the game's memory or, without it, with OCR."""
         crop = cast_text_crop(rect)
         end = time.monotonic() + CAST_GRADE_READ_S
         while time.monotonic() < end and not self.stop_event.is_set():
-            grade = cast_grade(screen.grab(*crop))
+            grade = ui.cast_grade(earlier) if ui else cast_grade(screen.grab(*crop))
             if grade is not None:
-                if grade == "perfect":
-                    self.stats.perfect_casts += 1
-                self.log(f"cast #{number}: {grade.upper()}")
+                self.stats.cast_grades[grade] = self.stats.cast_grades.get(grade, 0) + 1
+                missed = "" if grade == target else f", aimed for {target.upper()}"
+                self.log(f"cast #{number}: {grade.upper()}{missed}")
                 return
-            time.sleep(CAST_GRADE_POLL_S)
+            time.sleep(CAST_GRADE_MEMORY_POLL_S if ui else CAST_GRADE_POLL_S)
 
     # -- totem (fisch_totem.lua) ---------------------------------------------------
 

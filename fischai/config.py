@@ -19,6 +19,9 @@ DATA_DIR = _xdg("XDG_DATA_HOME", ".local/share")
 STATE_DIR = _xdg("XDG_STATE_HOME", ".local/state")
 CONFIG_PATH = CONFIG_DIR / "config.toml"
 
+# Fisch's cast grades, from the shortest throw to the longest.
+CAST_GRADES = ("meh", "fine", "good", "great", "amazing", "perfect")
+
 TEMPLATE = """\
 # FischAI settings. The settings window (`fischai gui`) rewrites this file and
 # applies changes at once; `fischai run` reads it each time the macro starts.
@@ -33,8 +36,8 @@ debug_snapshots = {general_debug_snapshots}  # save what the macro saw at each c
 [fishing]
 auto_cast = {fishing_auto_cast}
 auto_shake = {fishing_auto_shake}
-perfect_cast = {fishing_perfect_cast}          # release when the power bar's fill reaches the green marker
-cast_hold_ms = {fishing_cast_hold_ms}          # how long the cast is held when the power bar is not used
+cast_grade = {fishing_cast_grade}          # meh | fine | good | great | amazing | perfect: the grade each cast aims for
+cast_hold_ms = {fishing_cast_hold_ms}          # how long the cast is held when the power bar cannot be read
 recast_delay_ms = {fishing_recast_delay_ms}    # wait after a catch before casting again
 
 [reel]
@@ -84,7 +87,7 @@ class General:
 class Fishing:
     auto_cast: bool = True
     auto_shake: bool = True
-    perfect_cast: bool = True
+    cast_grade: str = "perfect"
     cast_hold_ms: int = 500
     recast_delay_ms: int = 1500
 
@@ -162,6 +165,7 @@ def _check(cond, message):
 def _validate(cfg):
     keycode(cfg.general.hotkey)
     f, r = cfg.fishing, cfg.reel
+    _check(f.cast_grade in CAST_GRADES, f"fishing.cast_grade must be one of {', '.join(CAST_GRADES)}")
     _check(50 <= f.cast_hold_ms <= 5000, "fishing.cast_hold_ms must be 50-5000")
     _check(100 <= f.recast_delay_ms <= 10000, "fishing.recast_delay_ms must be 100-10000")
     _check(r.backend in ("auto", "ncnn", "onnxruntime"), "reel.backend must be auto, ncnn or onnxruntime")

@@ -17,6 +17,9 @@ a Roblox update is found again instead of read wrongly):
                +0x104 AbsoluteSize (float w, h), in client pixels; a ScreenGui
                       that keeps the 58 px top-bar inset reads (0, 58) 1880x940
                       in a 1880x998 window, one that ignores it (0, 0) 1880x998
+    TextLabel  +0xb78, +0xdc0, +0xe08, +0xe20  its text (std::string), the
+                      latter two with rich-text tags; found again from the
+                      HUD's "Level N" label
 
 Strings are libc++ std::string: short ones inline with the length doubled in
 the first byte, long ones as {capacity|1, size, data*}.
@@ -25,11 +28,14 @@ the first byte, long ones as {capacity|1, size, data*}.
 import ctypes
 import ctypes.util
 import os
+import re
 import struct
 import threading
 import time
 
 import numpy as np
+
+from .config import CAST_GRADES
 
 SOBER_COMM = "sober"
 GAME_COMM = "Main"
@@ -41,6 +47,8 @@ SCAN_OFFSETS = range(0x20, 0x140, 8)    # where name/parent/children may sit in 
 GEOMETRY_SPAN = 0x400                   # bytes of a GuiBase2d searched for AbsoluteSize
 ALIVE_CHECK_S = 1.0
 ATTACH_RETRY_S = 10.0                   # an attach scans ~2 GB of the game's heap (~5 s)
+TEXT_SCAN = range(0x80, 0x1200, 8)      # where a TextLabel may keep its text
+LEVEL_TEXT = re.compile(r"Level \d+")
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
@@ -359,15 +367,40 @@ class FischUI(RobloxMemory):
         PlayerGui.reel.bar.{playerbar, fish}            the reel minigame;
                     .bar.progress.bar                   progress = its width / progress's width;
                                                         the reel slides in from below the window
-        Workspace.<player>.HumanoidRootPart.power.powerbar.{bar, green}
-                                                        cast power bar, in the billboard's
-                                                        own pixels: bar.y is the top of the
-                                                        fill, green the zone at the top
+        Workspace.<player>.HumanoidRootPart
+            .power.powerbar.{bar, green}                cast power bar: bar is the fill, its
+                                                        height over powerbar's how full it is
+            .powerfeedback.title                        the cast's grade ("Meh..", "Fine.",
+                                                        "Good!", "Great!", "Amazing!!", "PERFECT!")
+
+    Each cast creates a new power and powerfeedback; the previous cast's linger
+    beside them for a while, so the newest is the live one.
     """
 
     def __init__(self, log):
         super().__init__(log)
         self._character = None
+        self._text_offsets = None
+
+    def _newest_child(self, inst, wanted):
+        found = None
+        for c in self.children(inst):
+            if self.name(c) == wanted:
+                found = c
+        return found
+
+    def text(self, inst):
+        """A TextLabel's text, or None."""
+        if self._text_offsets is None:
+            lvl = self.gui("hud", "safezone", "lvl")
+            self._text_offsets = [o for o in TEXT_SCAN if lvl and LEVEL_TEXT.fullmatch(self.proc.string(lvl + o) or "")]
+            if not self._text_offsets:
+                self.log("memory: could not find where text labels keep their text")
+        for o in self._text_offsets:
+            s = self.proc.string(inst + o)
+            if s:
+                return s
+        return None
 
     def shake_button(self):
         """(x, y, w, h) of the shake button in client pixels, or None."""
@@ -405,19 +438,36 @@ class FischUI(RobloxMemory):
             self._character = self.child(workspace, self.player_name) if workspace else None
         return self.child(self._character, "HumanoidRootPart") if self._character else None
 
-    def power_bar(self):
-        """(top of the fill, bottom of the green zone) in the bar's pixels while the
-        power bar shows, or None."""
+    def power_fill(self):
+        """How full the cast power bar is (0..1) while it shows, or None."""
         hrp = self._hrp()
-        power = self.child(hrp, "power") if hrp else None
+        power = self._newest_child(hrp, "power") if hrp else None
         bar = self.child(power, "powerbar") if power else None
-        fill, green = (self.child(bar, "bar"), self.child(bar, "green")) if bar else (None, None)
-        if not fill or not green:
+        fill = self.child(bar, "bar") if bar else None
+        if not fill:
             return None
-        f, g = self.rect(fill), self.rect(green)
-        if not f or not g or g[3] <= 0:
+        f, b = self.rect(fill), self.rect(bar)
+        if not f or not b or b[3] <= 0:
             return None
-        return f[1], g[1] + g[3]
+        return f[3] / b[3]
+
+    def grade_labels(self):
+        """The cast grade labels under the character now; pass them to cast_grade()."""
+        hrp = self._hrp()
+        return {c for c in self.children(hrp) if self.name(c) == "powerfeedback"} if hrp else set()
+
+    def cast_grade(self, earlier):
+        """The grade ("meh" … "perfect") on a grade label not in `earlier`, or None."""
+        hrp = self._hrp()
+        for c in self.children(hrp) if hrp else ():
+            if c in earlier or self.name(c) != "powerfeedback":
+                continue
+            title = self.child(c, "title")
+            text = (self.text(title) or "").lower() if title else ""
+            grade = next((g for g in CAST_GRADES if g in text), None)
+            if grade:
+                return grade
+        return None
 
 
 class MemoryLink:
