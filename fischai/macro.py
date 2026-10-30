@@ -38,6 +38,7 @@ SILENCE_RAMP_S = 1.5
 WINDOW_REFRESH_S = 1.0
 
 SHAKE_TIMEOUT_S = 16.0          # without a successful click
+SHAKE_FIRST_TIMEOUT_S = 30.0    # before the first button: in Sober it came 1-19 s after the cast
 # The press spans two game frames at 60 fps so the down and the up are never
 # read in the same frame.
 SHAKE_SETTLE_S = 0.016
@@ -273,7 +274,8 @@ class Shaker:
     button unless a frame without it came in between: the game can respawn
     the next button in the very same spot, and that one is clicked at once.
     A button that never left is clicked again after SHAKE_REARM_S (the click
-    missed). The watchdog recasts after 16 s without a successful click."""
+    missed). The watchdog recasts after 16 s without a successful click, or
+    30 s while no button has come up yet."""
 
     def __init__(self, io, pointer, log):
         self.io = io
@@ -295,8 +297,9 @@ class Shaker:
     def _timed_out(self, now):
         if self.last_progress is None:
             self.last_progress = now
-        if now - self.last_progress > SHAKE_TIMEOUT_S:
-            self.log(f"shake: nothing to click for {SHAKE_TIMEOUT_S:.0f} s, recasting")
+        limit = SHAKE_TIMEOUT_S if self.last_click is not None else SHAKE_FIRST_TIMEOUT_S
+        if now - self.last_progress > limit:
+            self.log(f"shake: nothing to click for {limit:.0f} s, recasting")
             self.reset()
             return True
         return False

@@ -8,7 +8,9 @@ boxes into a left-button press or release:
     neutral  = 0.5 + integral(KI * err/100 * dt)   gravity compensation
     duty     = clamp(neutral + KV * (v_hat - v_des), 0, 1)
 
-The duty becomes a first-order sigma-delta pulse train. When the target sits
+Fisch ignores input for the first 1.2 s of the minigame; the integral and
+the learner sit that window out. The duty becomes a first-order sigma-delta
+pulse train. When the target sits
 within half a bar of a track wall the bar is pinned to that wall (hold for
 the right one, release for the left) instead of oscillating against it.
 v_hat only advances on genuinely new observations, never on holdover frames.
@@ -28,6 +30,7 @@ TICK_S = 0.016
 
 STALE_S = 0.250               # AI_STALE_MS
 HOLDOVER_S = 0.500            # AI_HOLDOVER_MS
+REEL_LOCK_S = 1.2             # the minigame ignores input this long after it opens (Fisch wiki)
 MIN_CONF = 0.25               # AI_MIN_CONF_RELEEL
 STUCK_TICKS = 120             # AI_STUCK_FRAMES: ~2 s of a static bar ends the reel
 STUCK_DELTA_PX = 2.0
@@ -236,7 +239,8 @@ class Reeler:
             return
         self.io.button(down)
         self._down = down
-        self.learner.flips += 1
+        if not self.locked:
+            self.learner.flips += 1
 
     def release(self):
         self._set_mouse(False)
@@ -264,8 +268,16 @@ class Reeler:
         self.req_init_x = None
         self.req_arm_start = None
         self.req_last_event = -math.inf
+        self.reel_t0 = None
+        self.locked = True
 
     def tick(self, boxes, now, target_override=None, override_strict=False):
+        if self.reel_t0 is None:
+            self.reel_t0 = now
+        # Inputs still go out while the minigame is locked (our reel start
+        # lags its real start), but they neither train the learner nor charge
+        # the integral.
+        self.locked = now - self.reel_t0 < REEL_LOCK_S
         bar_ok = boxes.bar is not None and boxes.bar.conf >= MIN_CONF
         fish_ok = boxes.fish is not None and boxes.fish.conf >= MIN_CONF
         if bar_ok:
@@ -342,7 +354,8 @@ class Reeler:
 
     def _cascade(self, err, bar_center, bar_w, target, obs_t, now):
         s = self.settings
-        learning = s.learn or self.learner.t0 is not None   # a reel keeps the gains it started with
+        # A reel keeps the gains it started with, and learning starts when the lock ends.
+        learning = not self.locked and (s.learn or self.learner.t0 is not None)
         if learning:
             kp, kv = self.learner.gains(bar_w, now)
         else:
@@ -373,7 +386,8 @@ class Reeler:
 
         err_pred = err + self.vhat * latency
         v_des = _clamp(-kp * err_pred, -vmax, vmax)
-        self.neutral_i = _clamp(self.neutral_i + CAS_KI * (err / 100) * dt, -CAS_NEUTRAL_CLAMP, CAS_NEUTRAL_CLAMP)
+        if not self.locked:
+            self.neutral_i = _clamp(self.neutral_i + CAS_KI * (err / 100) * dt, -CAS_NEUTRAL_CLAMP, CAS_NEUTRAL_CLAMP)
         duty = _clamp(0.5 + self.neutral_i + kv * (self.vhat - v_des), 0.0, 1.0)
 
         self.wall_lo = bar_center if self.wall_lo is None else min(self.wall_lo, bar_center)
