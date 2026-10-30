@@ -719,7 +719,7 @@ class Macro:
             self.reel_telemetry.add(boxes)
             self.status("reel", self._reel_detail(boxes))
             if self.reeler.tick(boxes, now) == "ended":
-                self._end_reel(now, "bar stopped moving")
+                self._end_reel(now, "bar and fish stopped moving")
             self.sleep(REEL_TICK_S)
         elif self.phase == "shake":
             self.bridge.phase = "idle" if self.ui else "shake"

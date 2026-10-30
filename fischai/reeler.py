@@ -33,8 +33,9 @@ STALE_S = 0.250               # AI_STALE_MS
 HOLDOVER_S = 0.500            # AI_HOLDOVER_MS
 REEL_LOCK_S = 1.2             # the minigame ignores input this long after it opens (Fisch wiki)
 MIN_CONF = 0.25               # AI_MIN_CONF_RELEEL
-STUCK_TICKS = 120             # AI_STUCK_FRAMES: ~2 s of a static bar ends the reel
-STUCK_DELTA_PX = 2.0
+STILL_S = 2.0                 # AI_STUCK_FRAMES: bar and fish both this still this long ends the reel
+STILL_DELTA_PX = 2.0
+OPENING_STILL_MAX_S = 5.0     # both sit still ~2.5 s while the minigame opens; longer, it never started
 
 CAS_KP = 6.0                  # px/s of desired closing speed per px of error
 CAS_KV = 0.0015               # duty per px/s of velocity error
@@ -45,9 +46,6 @@ VEL_EMA_ALPHA = 0.55
 VEL_GAP_RESET_S = 0.250
 ACTUATION_S = 0.030           # game input + render delay on top of the observation age
 LATENCY_RANGE_S = (0.020, 0.200)
-HOLD_STATION_PX = 40          # AI_HOVER_BAND_PX: a slow bar this close is holding, not stuck
-HOLD_STATION_VEL = 60
-
 SMART_TARGET_OVERLAP = 0.15   # share of the bar kept over the fish when chasing an override
 
 REQUIEM_MIN_INTERVAL_S = 0.300
@@ -220,7 +218,7 @@ class GainLearner:
 
 class Reeler:
     """One instance per macro run. tick() returns "active" while the reel
-    continues and "ended" when the bar has sat still for ~2 s."""
+    continues and "ended" when the bar and the fish have both sat still for 2 s."""
 
     def __init__(self, io, settings, learned_gains_path, log):
         self.io = io
@@ -254,8 +252,9 @@ class Reeler:
         self.neutral_i = 0.0
         self.pwm_acc = 0.0
         self.last_tick = None
-        self.stuck_ticks = 0
-        self.last_bar_x = None
+        self.still_anchor = None        # (bar x, fish x) where both last came to rest
+        self.still_since = None
+        self.moved = False
         self.req_armed = False
         self.req_init_x = None
         self.req_arm_start = None
@@ -286,13 +285,14 @@ class Reeler:
         # class rides on holdover, so v_hat never differentiates a stale position.
         obs_t = min(boxes.bar_t, boxes.fish_t)
 
-        if self.last_bar_x is not None and abs(bar.x - self.last_bar_x) <= STUCK_DELTA_PX:
-            self.stuck_ticks += 1
-        else:
-            self.stuck_ticks = 0
-        self.last_bar_x = bar.x
-        if self.stuck_ticks >= STUCK_TICKS:
-            self.log("reel: bar static for 2 s, treating the reel as over")
+        # Once the reel is under way the fish never stops; the bar alone can rest at a wall.
+        anchor = self.still_anchor
+        if anchor is None:
+            self.still_anchor, self.still_since = (bar.x, fish.x), now
+        elif abs(bar.x - anchor[0]) > STILL_DELTA_PX or abs(fish.x - anchor[1]) > STILL_DELTA_PX:
+            self.still_anchor, self.still_since, self.moved = (bar.x, fish.x), now, True
+        elif now - self.still_since >= (STILL_S if self.moved else OPENING_STILL_MAX_S):
+            self.log(f"reel: bar and fish still for {now - self.still_since:.0f} s, treating the reel as over")
             return "ended"
 
         if not self.settings.auto_reel:
@@ -390,5 +390,3 @@ class Reeler:
 
         if learning:
             self.learner.observe(max(0.0, abs(err) - bar_w / 2))
-        if abs(err) < HOLD_STATION_PX and abs(self.vhat) < HOLD_STATION_VEL:
-            self.stuck_ticks = 0
