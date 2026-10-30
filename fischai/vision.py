@@ -26,6 +26,8 @@ SHAKE_CIRCLE_MIN_WHITE = 150    # near-white pixels required inside the circle
 SHAKE_WHITE_THRESH = 200
 SHAKE_TEMPLATE_THRESH = 0.65
 SHAKE_MISS_FULLFRAME_S = 0.6    # full-frame template sweep cadence on the miss path
+SHAKE_LOCAL_MARGIN = 1.6        # half-size, in max radii, of the first search box around the last button
+SHAKE_TEMPLATE_AFTER_S = 1.0    # template fallbacks only once the circle detector has lost the button this long
 REFERENCE_CLIENT_H = 900
 
 # HUD status icons, bottom-right quadrant.
@@ -84,6 +86,7 @@ class ShakeDetector:
     def __init__(self, template_root):
         self.templates = load_gray_templates(Path(template_root) / "shake")
         self._last_full_sweep = float("-inf")
+        self._last_circle_t = float("-inf")
         self.last_method = None
 
     def _find_circle(self, roi_rgb, scale):
@@ -117,19 +120,33 @@ class ShakeDetector:
         score, x, y, w, h = hit
         return x + w / 2, y + h / 2
 
-    def find(self, frame, first_look, now):
-        """Shake button centre (frame px) or None. Circle detector first, then the
-        wordmark template inside the lower-centre ROI. Until the first click of a
-        cast (`first_look`) every frame also sweeps the whole frame; afterwards
-        the full sweep runs at most every SHAKE_MISS_FULLFRAME_S."""
+    def find(self, frame, first_look, now, near=None):
+        """Shake button centre (frame px) or None. The circle detector looks
+        around `near` (the last button) first, then over the lower-centre ROI.
+        The wordmark template runs only once circles have been missing for
+        SHAKE_TEMPLATE_AFTER_S: right after a click the button is respawning,
+        and a slow fallback would only delay seeing it again. Until the first
+        click of a cast (`first_look`) every miss also sweeps the whole frame;
+        afterwards that sweep runs at most every SHAKE_MISS_FULLFRAME_S."""
+        scale = frame.shape[0] / REFERENCE_CLIENT_H
+        self.last_method = "circle"
+        if near is not None:
+            half = round(SHAKE_CIRCLE_MAX_R * scale * SHAKE_LOCAL_MARGIN)
+            x0, y0 = max(0, round(near[0]) - half), max(0, round(near[1]) - half)
+            hit = self._find_circle(frame[y0:y0 + 2 * half, x0:x0 + 2 * half], scale)
+            if hit is not None:
+                self._last_circle_t = now
+                return x0 + hit[0], y0 + hit[1]
         rx, ry, rw, rh = _roi(frame.shape, SHAKE_ROI)
         roi = frame[ry:ry + rh, rx:rx + rw]
-        scale = frame.shape[0] / REFERENCE_CLIENT_H
         hit = self._find_circle(roi, scale)
-        self.last_method = "circle"
-        if hit is None:
-            hit = self._find_template(roi)
-            self.last_method = "template"
+        if hit is not None:
+            self._last_circle_t = now
+            return rx + hit[0], ry + hit[1]
+        if now - self._last_circle_t < SHAKE_TEMPLATE_AFTER_S:
+            return None
+        hit = self._find_template(roi)
+        self.last_method = "template"
         if hit is not None:
             return rx + hit[0], ry + hit[1]
         if first_look or now - self._last_full_sweep >= SHAKE_MISS_FULLFRAME_S:

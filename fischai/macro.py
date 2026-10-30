@@ -34,12 +34,16 @@ SILENCE_RAMP_S = 1.5
 WINDOW_REFRESH_S = 1.0
 
 SHAKE_TIMEOUT_S = 16.0          # without a successful click
-SHAKE_SETTLE_S = 0.008
-SHAKE_HOLD_S = 0.015
+# Longer than ExoPanda's 8/15 ms: in Sober, 15 ms clicks mostly left the
+# shake button where it was (an accepted shake moves it), while the long
+# presses of the cast and the reel did land.
+SHAKE_SETTLE_S = 0.030
+SHAKE_HOLD_S = 0.050
 SHAKE_JIGGLE_DY_PX = 3
 SHAKE_JIGGLE_GAP_S = 0.008
-SHAKE_DEDUP_EPS_PX = 6
-SHAKE_DEDUP_REARM_S = 0.400
+SHAKE_SAME_BUTTON_PX = 30       # one button's detected centre wanders up to ~15 px between frames
+SHAKE_REARM_S = 0.400           # same spot, never seen gone: the click missed, retry
+SHAKE_NEAR_S = 1.0              # search around the last button first while it is this recent
 
 # The rod lives in hotbar slot 1. Alternating 2 -> 1 presses always end with
 # the rod in hand; pressing 1 alone would put an already-held rod away.
@@ -213,9 +217,12 @@ class Stats:
 
 
 class Shaker:
-    """fisch_shaker.lua vision path: one click per detected button position,
-    re-armed after 400 ms if the button has not moved (the click missed), and
-    a watchdog that recasts after 16 s without a successful click."""
+    """One click per shake button, after fisch_shaker.lua's vision path. A
+    detection within SHAKE_SAME_BUTTON_PX of the last click is that same
+    button unless a frame without it came in between: the game can respawn
+    the next button in the very same spot, and that one is clicked at once.
+    A button that never left is clicked again after SHAKE_REARM_S (the click
+    missed). The watchdog recasts after 16 s without a successful click."""
 
     def __init__(self, io, pointer, log):
         self.io = io
@@ -226,7 +233,13 @@ class Shaker:
     def reset(self):
         self.last_click = None
         self.last_click_t = -math.inf
+        self.gone_since_click = True
         self.last_progress = None
+        self.spots = []     # distinct button positions clicked this cast
+
+    def _note_spot(self, x, y):
+        if all(math.dist((x, y), s) > SHAKE_SAME_BUTTON_PX for s in self.spots):
+            self.spots.append((x, y))
 
     def _timed_out(self, now):
         if self.last_progress is None:
@@ -238,6 +251,8 @@ class Shaker:
         return False
 
     def wait(self, now):
+        """A frame without a button."""
+        self.gone_since_click = True
         return "timeout" if self._timed_out(now) else "waiting"
 
     def click(self, x, y, suppress, now):
@@ -245,8 +260,9 @@ class Shaker:
             return "timeout"
         if suppress:
             return "waiting"
-        if self.last_click is not None and math.dist((x, y), self.last_click) <= SHAKE_DEDUP_EPS_PX \
-                and now - self.last_click_t < SHAKE_DEDUP_REARM_S:
+        if (self.last_click is not None and not self.gone_since_click
+                and math.dist((x, y), self.last_click) <= SHAKE_SAME_BUTTON_PX
+                and now - self.last_click_t < SHAKE_REARM_S):
             return "waiting"
         # Warp, nudge down and back, then click: Roblox can miss a same-frame
         # warp + click and click at the old cursor position.
@@ -261,7 +277,9 @@ class Shaker:
         time.sleep(SHAKE_HOLD_S)
         self.io.button(False)
         self.last_click, self.last_click_t = (x, y), time.monotonic()
+        self.gone_since_click = False
         self.last_progress = self.last_click_t
+        self._note_spot(x, y)
         return "clicked"
 
 
@@ -340,6 +358,9 @@ class Macro:
         self.reel_started = -math.inf
         self.reel_telemetry = ReelTelemetry()
         self.cast_shake_clicks = 0
+        self.cast_t = -math.inf
+        self.shake_last_hit = None
+        self.shake_last_hit_t = -math.inf
         self.reel_last_live = -math.inf
         self.consec_fish = 0
         self.shake_hint_frames = 0
@@ -402,7 +423,11 @@ class Macro:
         self.reel_started = now
         self.reel_telemetry = ReelTelemetry()
         self.phase = "reel"
-        self.log(f"reel: {how} after {self.cast_shake_clicks} shake click(s)")
+        since_cast = f" in {now - self.cast_t:.1f} s" if self.cast_t > 0 else ""
+        # The button jumps after every shake the game accepts, so many clicks
+        # on few positions means the clicks are not landing.
+        self.log(f"reel: {how} after {self.cast_shake_clicks} shake click(s) on "
+                 f"{len(self.shaker.spots)} button position(s){since_cast}")
 
     # -- main loop -------------------------------------------------------------
 
@@ -515,8 +540,10 @@ class Macro:
         hit = None
         if self.cfg.fishing.auto_shake:
             frame = self.grab_window()
-            hit = self.vision.shake.find(frame, first_look=not self.shake_clicked_this_cast, now=now)
+            near = self.shake_last_hit if now - self.shake_last_hit_t < SHAKE_NEAR_S else None
+            hit = self.vision.shake.find(frame, first_look=not self.shake_clicked_this_cast, now=now, near=near)
         if hit is not None:
+            self.shake_last_hit, self.shake_last_hit_t = hit, now
             self.shake_clicked_this_cast = True
             self._mark_activity()
             result = self.shaker.click(self.win.x + hit[0], self.win.y + hit[1], suppress, now)
@@ -567,6 +594,7 @@ class Macro:
             self.io.button(False)
         self.stats.casts += 1
         self.log(f"cast #{self.stats.casts}")
+        self.cast_t = time.monotonic()
         self.cast_shake_clicks = 0
         self.waiting_for_bite = True
         self.recast_anchor = None
