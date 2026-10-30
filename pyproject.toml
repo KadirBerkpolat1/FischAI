@@ -1,0 +1,19 @@
+[project]
+name = "fischai"
+version = "0.1.0"
+description = "Fisch (Roblox) macro for Sober on Hyprland, driven by ExoPanda's reel detection model"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2",
+    "opencv-python-headless>=4.10",
+    "onnxruntime>=1.20",
+    "ncnn>=1.0.20250503",
+    "pnnx>=20250503",
+]
+
+[project.scripts]
+fischai = "fischai.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
