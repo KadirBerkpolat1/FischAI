@@ -31,6 +31,7 @@ BAR_CLASS = "catch-bar"
 DEFAULT_REGION = (0.21, 0.76, 0.79, 0.96)
 RECENTER_SAMPLES = 15            # confident bar sightings before the strip re-centres on them
 RECENTER_MIN_CONF = 0.6
+SHAKE_PHASE_FPS = 20
 
 # Box tracker, ExoPanda's tracker.rs constants: one-euro filters on each
 # class's centre and size, and a cap on centre motion that gives way after
@@ -252,8 +253,10 @@ class AiBridge(threading.Thread):
     publishes the newest Boxes. Capturing (~8 ms) runs in its own thread, so
     it overlaps inference (~14 ms on the GPU) and the rate is set by the
     slower of the two instead of their sum. Captures come at `settings.fps`
-    (read every frame, so it can be changed live) while the macro is in the
-    shake or reel phase and at `idle_fps` otherwise."""
+    (read every frame, so it can be changed live) while the macro reels, at
+    up to SHAKE_PHASE_FPS while it shakes (it only has to notice the reel
+    start, and the minigame ignores input for its first 1.2 s; the shake
+    loop captures the whole window meanwhile) and at `idle_fps` otherwise."""
 
     def __init__(self, model, window_rect, region, settings, idle_fps, log):
         super().__init__(daemon=True, name="reel-detector")
@@ -263,7 +266,7 @@ class AiBridge(threading.Thread):
         self.settings = settings
         self.idle_fps = idle_fps
         self.log = log
-        self.active = False
+        self.phase = "idle"                 # "idle" | "shake" | "reel", set by the macro
         self.latest = Boxes()
         self.frame_ms = 0.0                 # inference time per frame
         self.error = None
@@ -283,9 +286,16 @@ class AiBridge(threading.Thread):
             self.error = str(error)
             self.log(f"detector error: {error}")
 
+    def _fps(self):
+        if self.phase == "reel":
+            return self.settings.fps
+        if self.phase == "shake":
+            return min(self.settings.fps, SHAKE_PHASE_FPS)
+        return self.idle_fps
+
     def _capture_loop(self):
         while not self._stop_event.is_set():
-            period = 1.0 / (self.settings.fps if self.active else self.idle_fps)
+            period = 1.0 / self._fps()
             win = self.window_rect()
             if win is None:
                 self._stop_event.wait(period)

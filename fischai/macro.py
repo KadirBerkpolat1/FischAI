@@ -48,6 +48,7 @@ SHAKE_JIGGLE_DY_PX = 3
 SHAKE_JIGGLE_GAP_S = 0.008
 SHAKE_SAME_BUTTON_PX = 30
 SHAKE_REARM_S = 0.300           # same spot, never seen gone: the click missed, retry
+SHAKE_DEAD_AFTER_CLICKS = 3     # clicks a "button" may ignore before its spot is left alone
 
 # The rod lives in hotbar slot 1. Alternating 2 -> 1 presses always end with
 # the rod in hand; pressing 1 alone would put an already-held rod away.
@@ -293,8 +294,11 @@ class Shaker:
     button unless a frame without it came in between: the game can respawn
     the next button in the very same spot, and that one is clicked at once.
     A button that never left is clicked again after SHAKE_REARM_S (the click
-    missed). The watchdog recasts after 16 s without a successful click, or
-    30 s while no button has come up yet."""
+    missed); one that sits through SHAKE_DEAD_AFTER_CLICKS clicks is not a
+    button, and since a click beside the button cancels the cast in Fisch,
+    that spot is left alone for the rest of the cast. The watchdog recasts
+    after 16 s without a successful click, or 30 s while no button has come
+    up yet."""
 
     def __init__(self, io, pointer, log):
         self.io = io
@@ -307,7 +311,9 @@ class Shaker:
         self.last_click_t = -math.inf
         self.gone_since_click = True
         self.last_progress = None
-        self.spots = []     # distinct button positions clicked this cast
+        self.repeats = 0
+        self.spots = []         # distinct button positions clicked this cast
+        self.dead_spots = []    # layout px of SHAKE-like matches that ignored clicks
 
     def _note_spot(self, x, y):
         if all(math.dist((x, y), s) > SHAKE_SAME_BUTTON_PX for s in self.spots):
@@ -331,11 +337,17 @@ class Shaker:
     def click(self, x, y, suppress, now):
         if self._timed_out(now):
             return "timeout"
-        if suppress:
+        if suppress or any(math.dist((x, y), d) <= SHAKE_SAME_BUTTON_PX for d in self.dead_spots):
             return "waiting"
-        if (self.last_click is not None and not self.gone_since_click
-                and math.dist((x, y), self.last_click) <= SHAKE_SAME_BUTTON_PX
-                and now - self.last_click_t < SHAKE_REARM_S):
+        same = (self.last_click is not None and not self.gone_since_click
+                and math.dist((x, y), self.last_click) <= SHAKE_SAME_BUTTON_PX)
+        if same and now - self.last_click_t < SHAKE_REARM_S:
+            return "waiting"
+        self.repeats = self.repeats + 1 if same else 0
+        if self.repeats >= SHAKE_DEAD_AFTER_CLICKS:
+            self.dead_spots.append((x, y))
+            self.repeats = 0
+            self.log(f"shake: ignoring a SHAKE-like spot at {x:.0f},{y:.0f} that did not react to clicks")
             return "waiting"
         # Warp, nudge down and back, then click: Roblox can miss a same-frame
         # warp + click and click at the old cursor position.
@@ -560,7 +572,7 @@ class Macro:
         finally:
             self.reeler.release()
             self.raw_io.release_all()
-            self.bridge.active = False
+            self.bridge.phase = "idle"
             if self.reeler.learner.rods:
                 try:
                     self.reeler.learner.save()
@@ -570,7 +582,7 @@ class Macro:
     def _pause_until_focused(self):
         self.reeler.release()
         self.raw_io.release_all()
-        self.bridge.active = False
+        self.bridge.phase = "idle"
         self.status("paused", "Sober is not focused")
         self.log("paused: Sober lost focus")
         while not self.focus.is_focused():
@@ -595,7 +607,7 @@ class Macro:
         why = why.rstrip(".")
         self.reeler.release()
         self.raw_io.release_all()
-        self.bridge.active = False
+        self.bridge.phase = "idle"
         self.stats.rejoins += 1
         self.log(f"recovery: {why}; restarting Sober into Fisch")
         self.notify(f"Lost the game ({why}), rejoining Fisch.")
@@ -663,7 +675,7 @@ class Macro:
         reel_live = stay_reel or enter_strict
 
         if self.phase == "reel" or reel_live:
-            self.bridge.active = True
+            self.bridge.phase = "reel"
             if not reel_live:
                 self._end_reel(now, "minigame closed")
                 return
@@ -676,13 +688,13 @@ class Macro:
                 self._end_reel(now, "bar stopped moving")
             self.sleep(REEL_TICK_S)
         elif self.phase == "shake":
-            self.bridge.active = True
+            self.bridge.phase = "shake"
             self._check_error_prompt(now)
             reel_hint = both_now and boxes.bar.conf >= DUAL_ENTRY_MIN_CONF
             self._shake_step(now, fish_now or both_now, reel_hint)
             self.sleep(SHAKE_TICK_S)
         else:
-            self.bridge.active = False
+            self.bridge.phase = "idle"
             self.reeler.release()
             self._check_error_prompt(now)
             self._idle_step(now)
@@ -712,7 +724,8 @@ class Macro:
         hit = frame = None
         if self.cfg.fishing.auto_shake:
             frame = self.grab_window()
-            hit = self.vision.shake.find(frame)
+            dead = [(x - self.win.x, y - self.win.y) for x, y in self.shaker.dead_spots]
+            hit = self.vision.shake.find(frame, exclude=dead)
         if hit is not None:
             self._mark_activity()
             result = self.shaker.click(self.win.x + hit[0], self.win.y + hit[1], suppress, now)

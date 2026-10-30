@@ -16,16 +16,18 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Shake: the SHAKE wordmark on the round button. Its height is a fixed share
-# of the client height (43 px at 1080, measured in Sober); until a confident
-# match pins the real size, sizes around that are tried. Matching runs at
-# half resolution.
-SHAKE_ROI = (0.02, 0.04, 0.96, 0.92)
+# Shake: the SHAKE wordmark on the round button, 43 px tall at a 1080 px
+# client (measured in Sober). The button pops in and wobbles when clicked,
+# so its size varies (0.7-1.06x in a recording) and every frame tries a few
+# sizes. Matching runs at half resolution with the smallest of ExoPanda's
+# templates, which correlates best with Sober's rendering (0.91 vs 0.83-0.86).
+# The ROI stops short of the bottom-right HUD, which scores 0.57 at 0.82x.
+SHAKE_ROI = (0.04, 0.10, 0.92, 0.82)
 SHAKE_WORD_H = 43 / 1080
-SHAKE_SIZE_STEPS = (0.88, 1.0, 1.12)
+SHAKE_SIZE_STEPS = (0.85, 0.93, 1.0, 1.08)
 SHAKE_MATCH_SCALE = 0.5
-SHAKE_THRESH = 0.55             # real buttons score 0.65-0.9 at half resolution, anything else under 0.45
-SHAKE_PIN_THRESH = 0.70         # a match this good fixes the wordmark size for that client height
+SHAKE_THRESH = 0.60             # recorded buttons mostly 0.6-0.93; static scenery up to 0.57
+SHAKE_EXCLUDE_PX = 40           # radius around a spot the macro gave up on
 
 # Cast power bar: a dark vertical bar right of the character with a thin
 # green marker on top. While the button is held the fill rises from the
@@ -105,44 +107,45 @@ class ShakeDetector:
     bobber and bright scenery in Sober, and clicking those does nothing."""
 
     def __init__(self, template_root):
-        self.sources = load_gray_templates(Path(template_root) / "shake")
-        self._sized = {}        # (client height, size factor) -> templates at match scale
-        self._pinned = {}       # client height -> size factor of a confident match
+        self.source = min(load_gray_templates(Path(template_root) / "shake"), key=lambda t: t.shape[0])
+        self._sized = {}        # client height -> templates at match scale, one per size step
         self.last_score = None
 
-    def _templates(self, client_h, factor):
-        key = (client_h, factor)
-        if key not in self._sized:
-            h = SHAKE_WORD_H * client_h * factor * SHAKE_MATCH_SCALE
-            self._sized[key] = [
+    def _templates(self, client_h):
+        if client_h not in self._sized:
+            t = self.source
+            heights = (SHAKE_WORD_H * client_h * f * SHAKE_MATCH_SCALE for f in SHAKE_SIZE_STEPS)
+            self._sized[client_h] = [
                 cv2.resize(t, (max(1, round(t.shape[1] * h / t.shape[0])), max(1, round(h))), interpolation=cv2.INTER_AREA)
-                for t in self.sources
+                for h in heights
             ]
-        return self._sized[key]
+        return self._sized[client_h]
 
-    def find(self, frame):
-        """Shake button centre (frame px) or None; `last_score` keeps the best correlation."""
-        client_h = frame.shape[0]
+    def find(self, frame, exclude=()):
+        """Shake button centre (frame px) or None, ignoring matches centred
+        within SHAKE_EXCLUDE_PX of the `exclude` points; `last_score` keeps
+        the best correlation."""
         rx, ry, rw, rh = _roi(frame.shape, SHAKE_ROI)
         gray = cv2.cvtColor(frame[ry:ry + rh, rx:rx + rw], cv2.COLOR_RGB2GRAY)
         small = cv2.resize(gray, None, fx=SHAKE_MATCH_SCALE, fy=SHAKE_MATCH_SCALE, interpolation=cv2.INTER_AREA)
-        pinned = self._pinned.get(client_h)
+        r = round(SHAKE_EXCLUDE_PX * SHAKE_MATCH_SCALE)
         best = None
-        for factor in (pinned,) if pinned else SHAKE_SIZE_STEPS:
-            for template in self._templates(client_h, factor):
-                th, tw = template.shape
-                if th > small.shape[0] or tw > small.shape[1]:
-                    continue
-                scores = np.nan_to_num(cv2.matchTemplate(small, template, cv2.TM_CCOEFF_NORMED), nan=-1.0, posinf=-1.0, neginf=-1.0)
-                _, score, _, (x, y) = cv2.minMaxLoc(scores)
-                if best is None or score > best[0]:
-                    best = (score, x + tw / 2, y + th / 2, factor)
+        for template in self._templates(frame.shape[0]):
+            th, tw = template.shape
+            if th > small.shape[0] or tw > small.shape[1]:
+                continue
+            scores = np.nan_to_num(cv2.matchTemplate(small, template, cv2.TM_CCOEFF_NORMED), nan=-1.0, posinf=-1.0, neginf=-1.0)
+            for ex, ey in exclude:
+                x0 = round((ex - rx) * SHAKE_MATCH_SCALE - tw / 2)
+                y0 = round((ey - ry) * SHAKE_MATCH_SCALE - th / 2)
+                scores[max(0, y0 - r):max(0, y0 + r + 1), max(0, x0 - r):max(0, x0 + r + 1)] = -1.0
+            _, score, _, (x, y) = cv2.minMaxLoc(scores)
+            if best is None or score > best[0]:
+                best = (score, x + tw / 2, y + th / 2)
         self.last_score = None if best is None else best[0]
         if best is None or best[0] < SHAKE_THRESH:
             return None
-        score, x, y, factor = best
-        if pinned is None and score >= SHAKE_PIN_THRESH:
-            self._pinned[client_h] = factor
+        _, x, y = best
         return rx + x / SHAKE_MATCH_SCALE, ry + y / SHAKE_MATCH_SCALE
 
 
