@@ -54,8 +54,10 @@ learn = {reel_learn}               # tune the reel gains per rod over time
 
 [totem]
 enabled = {totem_enabled}
-day_slot = {totem_day_slot}        # hotbar 1-9, 0 = off (e.g. Sundial)
-night_slot = {totem_night_slot}    # hotbar 1-9, 0 = off (e.g. Aurora)
+day_name = {totem_day_name}        # a totem whose hotbar name contains this is used by day (e.g. Sundial)
+night_name = {totem_night_name}    # same, by night (e.g. Aurora)
+day_slot = {totem_day_slot}        # fallback hotbar 1-9 when the hotbar cannot be read, 0 = off
+night_slot = {totem_night_slot}    # fallback hotbar 1-9, 0 = off
 
 [potions]
 enabled = {potions_enabled}
@@ -109,6 +111,8 @@ class Reel:
 @dataclass
 class Totem:
     enabled: bool = False
+    day_name: str = "Sundial"
+    night_name: str = "Aurora"
     day_slot: int = 0
     night_slot: int = 0
 

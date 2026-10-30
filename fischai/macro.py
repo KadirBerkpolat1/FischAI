@@ -493,6 +493,7 @@ class Macro:
         self.totem_fired_cycle = None
         self.totem_last_fire = -math.inf
         self.totem_next_fire = -math.inf
+        self.totem_depleted = set()     # cycles whose totem ran out this run; that half stays off
 
     # -- helpers -------------------------------------------------------------
 
@@ -907,7 +908,29 @@ class Macro:
 
     def _totem_enabled(self):
         t = self.cfg.totem
-        return t.enabled and (1 <= t.day_slot <= 9 or 1 <= t.night_slot <= 9)
+        return t.enabled and bool(t.day_name.strip() or t.night_name.strip() or t.day_slot or t.night_slot)
+
+    def _totem_target(self, cycle):
+        """("fire", label, slot) for this cycle's totem, ("gone", name, None)
+        when the hotbar can be read and holds none, ("wait", name, None) when
+        the hotbar cannot be read now and no fallback slot is set. The totem
+        is found by name in the hotbar; the slot settings are the fallback
+        for when the game's memory is not readable."""
+        t = self.cfg.totem
+        name = (t.day_name if cycle == "day" else t.night_name).strip()
+        fallback = t.day_slot if cycle == "day" else t.night_slot
+        if name and self.ui is not None:
+            items = self.ui.hotbar()
+            if items is None:
+                return "wait", name, None
+            match = next(((s, n, c) for s, (n, c) in sorted(items.items()) if name.lower() in n.lower()), None)
+            if match is None:
+                return "gone", name, None
+            slot, item, count = match
+            return "fire", item + (f" x{count}" if count else ""), slot
+        if 1 <= fallback <= 9:
+            return "fire", name or "totem", fallback
+        return "wait", name, None
 
     def _totem_tick(self):
         now = time.monotonic()
@@ -915,8 +938,16 @@ class Macro:
         if cycle is None:
             self.status("totem", "day/night unknown")
             return "wait"
-        slot = self.cfg.totem.day_slot if cycle == "day" else self.cfg.totem.night_slot
-        if not 1 <= slot <= 9:
+        if cycle in self.totem_depleted:
+            return "wait"
+        kind, label, slot = self._totem_target(cycle)
+        if kind == "gone" and self._totem_target(cycle)[0] == "gone":
+            # Confirmed twice, so a hotbar being rebuilt cannot switch it off.
+            self.totem_depleted.add(cycle)
+            self.log(f"totem: no '{label}' left in the hotbar, the {cycle} totem is off for this run")
+            self.notify(f"Out of totems: no '{label}' in the hotbar, the {cycle} totem is off; fishing continues.")
+            return "wait"
+        if kind != "fire":
             return "wait"
         if cycle == self.totem_fired_cycle and (cycle == "night" or now < self.totem_next_fire):
             return "wait"   # night totems once per night; day totems retry until night shows
@@ -927,7 +958,7 @@ class Macro:
         if self.world.cycle(now) != cycle:
             return "wait"
         self.status("totem", f"using the {cycle} totem (slot {slot})")
-        self.log(f"totem: {cycle}, using hotbar slot {slot}")
+        self.log(f"totem: {cycle}, using {label} (slot {slot})")
         self.io.press(str(slot))
         self.sleep(TOTEM_EQUIP_SETTLE_S)
         self.pointer.use_click(*self.win.center)

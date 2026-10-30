@@ -246,9 +246,14 @@ class Window(QWidget):
         self._switch("Her olta için kendini ayarlasın", c.reel, "learn")
 
         self._section("Totem")
-        self._switch("Totem kullan", c.totem, "enabled")
-        self._slot("Gündüz totemi slotu", c.totem, "day_slot")
-        self._slot("Gece totemi slotu", c.totem, "night_slot")
+        self._switch("Totem kullan", c.totem, "enabled",
+                     hint="İsmi yazılan totem hotbar'da kendiliğinden bulunur, hangi slotta olduğu önemli değil. "
+                          "Totem biterse o gündüz/gece totemi bu çalışmada kapatılır, balık tutma sürer ve "
+                          "Discord'a yazılır. Slotlar yalnız bellek okunamazsa yedek olarak kullanılır.")
+        self._text("Gündüz totemi", c.totem, "day_name", "Sundial")
+        self._text("Gece totemi", c.totem, "night_name", "Aurora")
+        self._slot("Gündüz yedek slotu", c.totem, "day_slot")
+        self._slot("Gece yedek slotu", c.totem, "night_slot")
 
         self._section("İksir")
         self._switch("İksir kullan", c.potions, "enabled")

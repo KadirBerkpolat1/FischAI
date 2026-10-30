@@ -364,6 +364,9 @@ class FischUI(RobloxMemory):
     """Fisch's fishing UI, as observed in Sober on 2026-10-31:
 
         PlayerGui.shakeui.safezone.<ImageButton>        the shake button
+        PlayerGui.backpack.hotbar.<ItemTemplate>        one hotbar slot: ItemName is
+                    .{ItemName, TextLabel, Stack}          the item's name, TextLabel its slot
+                                                        number, Stack (when present) its "xN" count
         PlayerGui.reel.bar.{playerbar, fish}            the reel minigame;
                     .bar.progress.bar                   progress = its width / progress's width;
                                                         the reel slides in from below the window
@@ -430,6 +433,26 @@ class FischUI(RobloxMemory):
         t, b = (self.rect(track), self.rect(fill)) if track and fill else (None, None)
         progress = b[2] / t[2] if t and b and t[2] > 0 else None
         return p, f, progress
+
+    def hotbar(self):
+        """{slot: (item name, stack count or None)} for the occupied hotbar
+        slots, or None when the hotbar cannot be read now."""
+        bar = self.gui("backpack", "hotbar")
+        if not bar:
+            return None
+        items = {}
+        for frame in self.children(bar):
+            name_label, num_label = self.child(frame, "ItemName"), self.child(frame, "TextLabel")
+            if not name_label or not num_label:
+                continue
+            name = " ".join(re.sub(r"<[^>]+>", " ", self.text(name_label) or "").split())
+            slot = (self.text(num_label) or "").strip()
+            if not name or not slot.isdigit():
+                continue
+            stack = self.child(frame, "Stack")
+            digits = re.search(r"\d+", self.text(stack) or "") if stack else None
+            items[int(slot)] = (name, int(digits.group()) if digits else None)
+        return items or None
 
     def _hrp(self):
         if self._character is None or self.name(self._character) != self.player_name:
