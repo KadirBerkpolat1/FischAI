@@ -216,6 +216,9 @@ class Window(QWidget):
         c = self.cfg
 
         self._section("Balık tutma")
+        self._switch("Oyunun belleğinden oku", c.general, "memory",
+                     hint="Shake düğmesini, reel çubuğunu ve güç çubuğunu oyunun belleğinden okur "
+                          "(yalnız okur, bir şey yazmaz). Okuyamazsa ya da kapalıyken her şey ekrandan.")
         self._switch("Oltayı kendisi atsın", c.fishing, "auto_cast")
         self._switch("Perfect cast", c.fishing, "perfect_cast",
                      hint="Güç çubuğunu izler, dolgu yeşil işarete gelince bırakır. Çubuk görünmezse "

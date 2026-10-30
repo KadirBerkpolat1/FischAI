@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import hypr, recovery, screen
+from .detector import Box, Boxes
 from .reeler import REEL_LOCK_S, Reeler
 from .vision import PowerBar, cast_grade, cast_text_crop
 
@@ -30,6 +31,7 @@ MIN_COUNTED_REEL_S = 1.5        # shorter "reels" are detector blips, not catche
 MAX_SNAPSHOTS = 400
 PROMPT_CHECK_AFTER_S = 60.0     # no reel for this long: start looking for Roblox's error prompt
 PROMPT_CHECK_EVERY_S = 30.0
+PROGRESS_EPS = 0.002            # catch progress read from memory: smaller steps back are rounding
 
 REEL_TICK_S = 0.016
 SHAKE_TICK_S = 0.008
@@ -64,6 +66,7 @@ CAST_PERFECT_GAP_PX = 3         # released here, the fill is inside the marker w
 CAST_LATE_GAP_PX = 25           # already falling this close to the top: release now, it only gets worse
 CAST_GRADE_READ_S = 1.4         # the grade text stays up about a second
 CAST_GRADE_POLL_S = 0.1
+CAST_MEMORY_POLL_S = 0.001      # the fill moves ~0.5 px per ms
 ROD_REEQUIP_INTERVAL_S = 3600
 
 TOTEM_EQUIP_SETTLE_S = 0.65
@@ -231,7 +234,9 @@ class Snapshots:
 
 
 class ReelTelemetry:
-    """How well the detector saw one reel, for the log line at its end."""
+    """How well the detector saw one reel, for the log line at its end. With
+    the game's memory it also follows the catch progress: a reel that never
+    lost any is a perfect catch."""
 
     def __init__(self, start):
         self.start = start
@@ -240,6 +245,13 @@ class ReelTelemetry:
         self.inside = [0, 0]
         self.bar_conf = self.fish_conf = 0.0
         self.last_frame_t = None
+        self.last_progress = None
+        self.progress_lost = False
+
+    def progress(self, value):
+        if self.last_progress is not None and value < self.last_progress - PROGRESS_EPS:
+            self.progress_lost = True
+        self.last_progress = value
 
     def add(self, boxes):
         if boxes.frame_t == self.last_frame_t:
@@ -266,6 +278,8 @@ class ReelTelemetry:
             return f"{name} in {n / self.frames:.0%} (avg {conf / n:.2f})" if n else f"{name} never seen"
 
         text = f"{self.frames} frames, {seen('bar', self.bar, self.bar_conf)}, {seen('fish', self.fish, self.fish_conf)}"
+        if self.last_progress is not None:
+            text += f", progress {self.last_progress:.0%}" + (" with losses" if self.progress_lost else " never lost")
         if sum(self.both):
             text += f", fish inside the bar {sum(self.inside) / sum(self.both):.0%}"
         if all(self.both):
@@ -334,7 +348,9 @@ class Shaker:
         self.gone_since_click = True
         return "timeout" if self._timed_out(now) else "waiting"
 
-    def click(self, x, y, suppress, now):
+    def click(self, x, y, suppress, now, trusted=False):
+        """`trusted`: the position comes from the game's memory, so it is the
+        button even if it ignores clicks for a while."""
         if self._timed_out(now):
             return "timeout"
         if suppress or any(math.dist((x, y), d) <= SHAKE_SAME_BUTTON_PX for d in self.dead_spots):
@@ -344,7 +360,7 @@ class Shaker:
         if same and now - self.last_click_t < SHAKE_REARM_S:
             return "waiting"
         self.repeats = self.repeats + 1 if same else 0
-        if self.repeats >= SHAKE_DEAD_AFTER_CLICKS:
+        if self.repeats >= SHAKE_DEAD_AFTER_CLICKS and not trusted:
             self.dead_spots.append((x, y))
             self.repeats = 0
             self.log(f"shake: ignoring a SHAKE-like spot at {x:.0f},{y:.0f} that did not react to clicks")
@@ -417,8 +433,9 @@ def _write_float(path, value):
 
 
 class Macro:
-    def __init__(self, cfg, win, io, focus, bridge, vision, state_dir, log, status, notify, stop_event, stats):
+    def __init__(self, cfg, win, io, focus, bridge, vision, memory, state_dir, log, status, notify, stop_event, stats):
         self.cfg = cfg
+        self.memory = memory                # robloxmem.MemoryLink
         self.win = win
         self.raw_io = io
         self.io = GuardedInput(io, focus, stop_event)
@@ -456,6 +473,9 @@ class Macro:
         self.last_activity = time.monotonic()
         self.last_reel_activity = time.monotonic()
         self.prompt_checked = -math.inf
+        self.ui = None                      # FischUI while the game's memory is readable, per step
+        self.memory_key = None
+        self.memory_obs_t = -math.inf
         self.last_equip = -math.inf
         self.totem_fired_cycle = None
         self.totem_last_fire = -math.inf
@@ -579,6 +599,23 @@ class Macro:
                 except OSError as e:
                     self.log(f"reel learner: could not save gains: {e}")
 
+    # -- reading the game's memory ------------------------------------------------
+
+    def _memory_boxes(self, now):
+        """The reel bar and fish from memory as detector boxes. Their capture time
+        is when the values last changed: the game moves them once per frame."""
+        reel = self.ui.reel()
+        if reel is None:
+            return Boxes(frame_t=now)
+        (bx, by, bw, bh), (fx, fy, fw, fh), progress = reel
+        if (bx, fx) != self.memory_key:
+            self.memory_key, self.memory_obs_t = (bx, fx), now
+        if progress is not None:
+            self.reel_telemetry.progress(progress)
+        ox, oy = self.win.x, self.win.y
+        return Boxes(Box(ox + bx, oy + by, bw, bh, 1.0), Box(ox + fx, oy + fy, fw, fh, 1.0),
+                     self.memory_obs_t, self.memory_obs_t, now)
+
     def _pause_until_focused(self):
         self.reeler.release()
         self.raw_io.release_all()
@@ -649,7 +686,8 @@ class Macro:
     def _step(self):
         now = time.monotonic()
         self._refresh_window(now)
-        boxes = self.bridge.latest
+        self.ui = self.memory.get() if self.cfg.general.memory else None
+        boxes = self._memory_boxes(now) if self.ui else self.bridge.latest
         fresh = now - boxes.frame_t < STALE_S
         if fresh and boxes.bar is not None:
             self.last_bar_seen = now
@@ -675,7 +713,7 @@ class Macro:
         reel_live = stay_reel or enter_strict
 
         if self.phase == "reel" or reel_live:
-            self.bridge.phase = "reel"
+            self.bridge.phase = "idle" if self.ui else "reel"
             if not reel_live:
                 self._end_reel(now, "minigame closed")
                 return
@@ -688,7 +726,7 @@ class Macro:
                 self._end_reel(now, "bar stopped moving")
             self.sleep(REEL_TICK_S)
         elif self.phase == "shake":
-            self.bridge.phase = "shake"
+            self.bridge.phase = "idle" if self.ui else "shake"
             self._check_error_prompt(now)
             reel_hint = both_now and boxes.bar.conf >= DUAL_ENTRY_MIN_CONF
             self._shake_step(now, fish_now or both_now, reel_hint)
@@ -722,17 +760,21 @@ class Macro:
             self._start_reel(now, "entered from a persistent box during shake")
             return
         hit = frame = None
-        if self.cfg.fishing.auto_shake:
+        trusted = self.ui is not None
+        if self.cfg.fishing.auto_shake and trusted:
+            r = self.ui.shake_button()
+            hit = (r[0] + r[2] / 2, r[1] + r[3] / 2) if r else None
+        elif self.cfg.fishing.auto_shake:
             frame = self.grab_window()
             dead = [(x - self.win.x, y - self.win.y) for x, y in self.shaker.dead_spots]
             hit = self.vision.shake.find(frame, exclude=dead)
         if hit is not None:
             self._mark_activity()
-            result = self.shaker.click(self.win.x + hit[0], self.win.y + hit[1], suppress, now)
+            result = self.shaker.click(self.win.x + hit[0], self.win.y + hit[1], suppress, now, trusted)
             if result == "clicked":
                 self.stats.shake_clicks += 1
                 self.cast_shake_clicks += 1
-                self.status("shake", f"clicked (match {self.vision.shake.last_score:.2f})")
+                self.status("shake", "clicked (memory)" if trusted else f"clicked (match {self.vision.shake.last_score:.2f})")
                 self._snap("shake", frame, [hit])
         else:
             result = self.shaker.wait(now)
@@ -801,6 +843,8 @@ class Macro:
         if bar is None:
             self.sleep(hold_s)
             return f"held {hold_s:.2f} s"
+        if self.ui is not None:
+            return self._hold_for_cast_memory(start, hold_s)
         crop = PowerBar.crop(self.rect)
         armed = seen_fill = False
         prev = None
@@ -826,6 +870,30 @@ class Macro:
             if armed and (gap <= CAST_PERFECT_GAP_PX or (prev is not None and gap > prev and gap <= CAST_LATE_GAP_PX)):
                 return f"released at {t:.2f} s, {gap} px below the marker"
             prev = gap
+
+    def _hold_for_cast_memory(self, start, hold_s):
+        """The same release from the game's memory (ExoPanda's memory rule with
+        the 3 px lead that graded PERFECT on screen): arm once the top of the
+        fill is below the green zone, release when it is back within
+        CAST_PERFECT_GAP_PX of the zone's bottom."""
+        armed = False
+        while True:
+            if self.stop_event.is_set():
+                raise Stopped
+            t = time.monotonic() - start
+            if t > CAST_MAX_S:
+                return f"held {t:.2f} s, the fill never reached the green zone (memory)"
+            bar = self.ui.power_bar()
+            if bar is None:
+                if t >= max(CAST_BAR_WAIT_S, hold_s):
+                    return f"held {t:.2f} s, no power bar in memory"
+            else:
+                top, green_bottom = bar
+                if top > green_bottom + CAST_ARM_GAP_PX:
+                    armed = True
+                elif armed and top <= green_bottom + CAST_PERFECT_GAP_PX:
+                    return f"released at {t:.2f} s, fill {top - green_bottom:.1f} below the green zone (memory)"
+            time.sleep(CAST_MEMORY_POLL_S)
 
     def _read_cast_grade(self, number, rect):
         """Log the grade Fisch writes over the character after a cast."""

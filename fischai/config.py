@@ -27,6 +27,7 @@ TEMPLATE = """\
 [general]
 hotkey = {general_hotkey}          # start / stop
 window = {general_window}          # window class, or a title substring
+memory = {general_memory}          # read the shake button, reel and power bar from the game's memory (read-only); off = screen only
 debug_snapshots = {general_debug_snapshots}  # save what the macro saw at each click and phase change
 
 [fishing]
@@ -75,6 +76,7 @@ summary_min = {webhook_summary_min}
 class General:
     hotkey: str = "f3"
     window: str = "org.vinegarhq.Sober"
+    memory: bool = True
     debug_snapshots: bool = False
 
 
