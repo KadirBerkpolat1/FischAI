@@ -268,7 +268,7 @@ class ReelTelemetry:
         if bar is not None and fish is not None:
             k = int(boxes.frame_t - self.start >= REEL_LOCK_S)
             self.both[k] += 1
-            self.inside[k] += bar.x <= fish.cx <= bar.x + bar.w
+            self.inside[k] += fish.x <= bar.x + bar.w and bar.x <= fish.x + fish.w   # progress grows on any overlap
 
     def summary(self):
         if not self.frames:
@@ -498,10 +498,7 @@ class Macro:
         if not force and now - self.window_checked < WINDOW_REFRESH_S:
             return
         self.window_checked = now
-        win = hypr.refresh(self.win)
-        if win.rect != self.win.rect:
-            self.reeler.forget_walls()
-        self.win = win
+        self.win = hypr.refresh(self.win)
 
     def _mark_activity(self):
         self.last_activity = time.monotonic()
@@ -660,7 +657,6 @@ class Macro:
             raise hypr.WindowError(f"Could not get back into Fisch after {recovery.ATTEMPTS} attempts.")
         self.win = win
         self.focus.retarget(win.address)
-        self.reeler.forget_walls()
         hypr.focus(win)
         self.sleep(recovery.SPAWN_SETTLE_S)
         self.phase = "cast"

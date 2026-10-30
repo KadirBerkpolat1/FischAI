@@ -10,10 +10,11 @@ boxes into a left-button press or release:
 
 Fisch ignores input for the first 1.2 s of the minigame; the integral and
 the learner sit that window out. The duty becomes a first-order sigma-delta
-pulse train. When the target sits
-within half a bar of a track wall the bar is pinned to that wall (hold for
-the right one, release for the left) instead of oscillating against it.
-v_hat only advances on genuinely new observations, never on holdover frames.
+pulse train. ExoPanda pins the bar to a track wall when the fish is near it;
+that is left out: in recorded reels the pin held the bar at the wall for up to
+a second after the fish had left it, and replaying those fish paths without
+the pin kept the fish inside the bar throughout. v_hat only advances on
+genuinely new observations, never on holdover frames.
 
 A perturb-and-observe learner tunes KP/KV per rod (keyed by bar width) from
 each reel's cost J = mean(out^2) + 30 * flips/s + 20 * max overshoot, where
@@ -46,10 +47,6 @@ ACTUATION_S = 0.030           # game input + render delay on top of the observat
 LATENCY_RANGE_S = (0.020, 0.200)
 HOLD_STATION_PX = 40          # AI_HOVER_BAND_PX: a slow bar this close is holding, not stuck
 HOLD_STATION_VEL = 60
-
-WALL_MARGIN_PX = 6.0
-WALL_HYST_PX = 24.0
-WALL_MIN_TRACK_PX = 120.0
 
 SMART_TARGET_OVERLAP = 0.15   # share of the bar kept over the fish when chasing an override
 
@@ -230,7 +227,6 @@ class Reeler:
         self.settings = settings            # read every tick, so changes apply live
         self.log = log
         self.learner = GainLearner(learned_gains_path, log)
-        self.wall_lo = self.wall_hi = None   # observed track walls, sticky across reels
         self._down = False
         self.reset(now=None)
 
@@ -245,9 +241,6 @@ class Reeler:
     def release(self):
         self._set_mouse(False)
 
-    def forget_walls(self):
-        self.wall_lo = self.wall_hi = None
-
     def reset(self, now):
         """End of a reel (or macro start): release, score the reel for the learner, clear per-reel state."""
         self.release()
@@ -260,7 +253,6 @@ class Reeler:
         self.vhat = 0.0
         self.neutral_i = 0.0
         self.pwm_acc = 0.0
-        self.wall_pin = None
         self.last_tick = None
         self.stuck_ticks = 0
         self.last_bar_x = None
@@ -390,42 +382,13 @@ class Reeler:
             self.neutral_i = _clamp(self.neutral_i + CAS_KI * (err / 100) * dt, -CAS_NEUTRAL_CLAMP, CAS_NEUTRAL_CLAMP)
         duty = _clamp(0.5 + self.neutral_i + kv * (self.vhat - v_des), 0.0, 1.0)
 
-        self.wall_lo = bar_center if self.wall_lo is None else min(self.wall_lo, bar_center)
-        self.wall_hi = bar_center if self.wall_hi is None else max(self.wall_hi, bar_center)
-        self._update_wall_pin(target, bar_w)
-
-        if self.wall_pin == "right":
-            want = True
-        elif self.wall_pin == "left":
-            want = False
-        else:
-            self.pwm_acc += duty
-            want = self.pwm_acc >= 1.0
-            if want:
-                self.pwm_acc -= 1.0
+        self.pwm_acc += duty
+        want = self.pwm_acc >= 1.0
+        if want:
+            self.pwm_acc -= 1.0
         self._set_mouse(want)
 
-        # A wall pin's large err is the fish's position, not a gain failure.
-        if learning and self.wall_pin is None:
+        if learning:
             self.learner.observe(max(0.0, abs(err) - bar_w / 2))
-        if self.wall_pin is not None or (abs(err) < HOLD_STATION_PX and abs(self.vhat) < HOLD_STATION_VEL):
+        if abs(err) < HOLD_STATION_PX and abs(self.vhat) < HOLD_STATION_VEL:
             self.stuck_ticks = 0
-
-    def _update_wall_pin(self, target, bar_w):
-        if self.wall_hi - self.wall_lo < WALL_MIN_TRACK_PX:
-            self.wall_pin = None
-            return
-        enter = bar_w / 2 + WALL_MARGIN_PX
-        leave = enter + WALL_HYST_PX
-        d_right = self.wall_hi - target
-        d_left = target - self.wall_lo
-        if self.wall_pin == "right":
-            if d_right > leave:
-                self.wall_pin = None
-        elif self.wall_pin == "left":
-            if d_left > leave:
-                self.wall_pin = None
-        elif d_right <= enter and d_right <= d_left:
-            self.wall_pin = "right"
-        elif d_left <= enter:
-            self.wall_pin = "left"
