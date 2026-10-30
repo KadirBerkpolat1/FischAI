@@ -466,6 +466,7 @@ class Macro:
         self.reeling = False
         self.reeler.reset(now)
         self.shaker.reset()
+        self.cast_shake_clicks = 0      # counted together with shaker.spots
         self.waiting_for_bite = False
         self.recast_anchor = None
         self.phase = "cast"
