@@ -450,7 +450,7 @@ class Macro:
             self.reeler.release()
             self.raw_io.release_all()
             self.bridge.active = False
-            if self.reeler.learner is not None and self.reeler.learner.rods:
+            if self.reeler.learner.rods:
                 try:
                     self.reeler.learner.save()
                 except OSError as e:

@@ -214,9 +214,9 @@ class Reeler:
 
     def __init__(self, io, settings, learned_gains_path, log):
         self.io = io
-        self.settings = settings
+        self.settings = settings            # read every tick, so changes apply live
         self.log = log
-        self.learner = GainLearner(learned_gains_path, log) if settings.learn else None
+        self.learner = GainLearner(learned_gains_path, log)
         self.wall_lo = self.wall_hi = None   # observed track walls, sticky across reels
         self._down = False
         self.reset(now=None)
@@ -226,8 +226,7 @@ class Reeler:
             return
         self.io.button(down)
         self._down = down
-        if self.learner is not None:
-            self.learner.flips += 1
+        self.learner.flips += 1
 
     def release(self):
         self._set_mouse(False)
@@ -238,8 +237,8 @@ class Reeler:
     def reset(self, now):
         """End of a reel (or macro start): release, score the reel for the learner, clear per-reel state."""
         self.release()
-        if self.learner is not None and now is not None:
-            self.learner.end_reel(now)
+        if now is not None:
+            self.learner.end_reel(now)   # scores only reels that ran on learned gains
         self.last_bar = self.last_fish = None
         self.last_bar_seen = self.last_fish_seen = -math.inf
         self.prev_obs_t = None
@@ -333,7 +332,8 @@ class Reeler:
 
     def _cascade(self, err, bar_center, bar_w, target, obs_t, now):
         s = self.settings
-        if self.learner is not None:
+        learning = s.learn or self.learner.t0 is not None   # a reel keeps the gains it started with
+        if learning:
             kp, kv = self.learner.gains(bar_w, now)
         else:
             kp, kv = CAS_KP, CAS_KV
@@ -382,7 +382,7 @@ class Reeler:
         self._set_mouse(want)
 
         # A wall pin's large err is the fish's position, not a gain failure.
-        if self.learner is not None and self.wall_pin is None:
+        if learning and self.wall_pin is None:
             self.learner.observe(err)
         if self.wall_pin is not None or (abs(err) < HOLD_STATION_PX and abs(self.vhat) < HOLD_STATION_VEL):
             self.stuck_ticks = 0

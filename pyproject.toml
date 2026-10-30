@@ -9,6 +9,7 @@ dependencies = [
     "onnxruntime>=1.20",
     "ncnn>=1.0.20250503",
     "pnnx>=20250503",
+    "pyside6-essentials>=6.8",
 ]
 
 [project.scripts]

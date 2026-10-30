@@ -1,69 +1,17 @@
-"""Command line: fischai setup | run | detect | record | doctor."""
+"""Command line: fischai gui | setup | run | detect | record | doctor."""
 
 import argparse
 import os
 import queue
 import shutil
 import sys
-import threading
 import time
-from dataclasses import dataclass
 
 from . import __version__, config, hypr, screen
+from .app import ASSETS_MISSING, MODEL_DIR, Controller, Log, assets_installed, load_vision, single_instance
 from .config import DATA_DIR, STATE_DIR
 
-MODEL_DIR = DATA_DIR / "model"
-TEMPLATE_DIR = DATA_DIR / "templates"
-IDLE_DETECT_FPS = 5
 STATUS_REFRESH_S = 0.5
-
-
-class Log:
-    """Timestamped lines to the terminal and fischai.log, plus one live status
-    line at the bottom of an interactive terminal."""
-
-    def __init__(self, path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = open(path, "a", buffering=1)
-        self.tty = sys.stdout.isatty()
-        self.lock = threading.Lock()
-        self.status_text = ""
-
-    def __call__(self, message):
-        line = f"{time.strftime('%H:%M:%S')} {message}"
-        with self.lock:
-            if self.tty:
-                sys.stdout.write("\r\033[K")
-            print(line, flush=True)
-            self.file.write(line + "\n")
-            if self.tty and self.status_text:
-                sys.stdout.write(self.status_text)
-                sys.stdout.flush()
-
-    def show_status(self, text):
-        if not self.tty:
-            return
-        with self.lock:
-            self.status_text = text[:max(10, shutil.get_terminal_size().columns - 1)]
-            sys.stdout.write("\r\033[K" + self.status_text)
-            sys.stdout.flush()
-
-    def clear_status(self):
-        self.show_status("")
-
-
-@dataclass
-class Vision:
-    shake: object
-    cycle: object
-    weather_event: object
-    aquarium: object
-
-
-def _load_vision():
-    from .vision import AquariumPanelDetector, CycleDetector, ShakeDetector, WeatherEventDetector
-    return Vision(ShakeDetector(TEMPLATE_DIR), CycleDetector(TEMPLATE_DIR),
-                  WeatherEventDetector(TEMPLATE_DIR), AquariumPanelDetector(TEMPLATE_DIR))
 
 
 def _load_config():
@@ -74,130 +22,57 @@ def _load_config():
 
 
 def _require_assets():
-    if not (MODEL_DIR / "model.json").is_file() or not TEMPLATE_DIR.is_dir():
-        raise SystemExit("The ExoPanda model and templates are not installed yet. Run:\n"
-                         "  fischai setup /path/to/fisch-<version>.zip")
-
-
-class Session:
-    """One start/stop cycle of the macro: window lookup, focus watcher,
-    detector thread and the fishing loop."""
-
-    def __init__(self, cfg, model, vision, io, log, on_exit):
-        from .detector import AiBridge, DetectionRegion
-        from .macro import Macro, MacroRunner, Stats
-
-        self.log = log
-        win = hypr.find_window(cfg.general.window)
-        self.focus = hypr.FocusWatcher(win.address)
-        self.focus.start()
-        self.stop_event = threading.Event()
-        self.stats = Stats()
-        self.phase, self.detail = "starting", ""
-        self.region = DetectionRegion(cfg.region_fractions)
-        self.macro = None
-        self.bridge = AiBridge(model, lambda: self.macro.rect if self.macro else win.rect,
-                               self.region, cfg.reel.fps, IDLE_DETECT_FPS, log)
-        self.macro = Macro(cfg, win, io, self.focus, self.bridge, vision, STATE_DIR, log,
-                           self._set_status, self.stop_event, self.stats)
-        self.runner = MacroRunner(self.macro, on_exit)
-
-    def _set_status(self, phase, detail):
-        self.phase, self.detail = phase, detail
-
-    def start(self):
-        self.bridge.start()
-        self.runner.start()
-
-    def stop(self):
-        self.stop_event.set()
-        if self.runner.is_alive():
-            self.runner.join(10)
-        self.bridge.stop()
-        if self.bridge.is_alive():
-            self.bridge.join(2)
-        self.focus.stop()
-
-    def status_line(self):
-        s = self.stats
-        return (f"[{self.phase}] {self.detail} | reels {s.reels} casts {s.casts} "
-                f"| detector {self.bridge.frame_ms:.0f} ms/frame")
+    if not assets_installed():
+        raise SystemExit(ASSETS_MISSING)
 
 
 def cmd_setup(args):
     from . import assets
     assets.install(args.source, DATA_DIR)
-    print(f"Done. Settings live in {config.CONFIG_PATH} (created on the first `fischai run`).")
+    print(f"Done. Settings live in {config.CONFIG_PATH}.")
+
+
+def cmd_gui(args):
+    from .gui import main
+    main()
 
 
 def cmd_run(args):
     hypr.require_hyprland()
     cfg = _load_config()
     _require_assets()
-    from .detector import ReelModel
-    from .inputdev import HotkeyListener, VirtualInput
-    from .webhook import Webhook, summary
+    from .inputdev import HotkeyListener
 
-    log = Log(STATE_DIR / "fischai.log")
-    model = ReelModel(MODEL_DIR, cfg.reel.backend)
-    log(f"FischAI {__version__}: reel detector on {model.backend.name}")
-    vision = _load_vision()
-    io = VirtualInput()
-    events = queue.Queue()
-    hotkey = cfg.general.hotkey
-    HotkeyListener([hotkey], lambda _key: events.put("toggle")).start()
-    log(f"Ready. In Sober, stand facing water with the rod in hotbar slot 1 and press {hotkey.upper()} "
-        f"to start or stop. Ctrl+C quits.")
-
-    session = None
-    webhook = None
-    next_summary = 0.0
-
-    def finish(reason):
-        nonlocal session
-        error = session.runner.error
-        session.stop()
-        log.clear_status()
-        text = summary(session.stats)
-        log(f"stopped ({reason}): {text}" + (f" - {error}" if error else ""))
-        webhook.send(f"Stopped ({error or reason}): {text}")
-        session = None
-
-    try:
-        while True:
-            try:
-                event = events.get(timeout=STATUS_REFRESH_S)
-            except queue.Empty:
-                event = None
-            if event == "toggle" and session is None:
+    with single_instance():
+        log = Log(STATE_DIR / "fischai.log")
+        controller = Controller(cfg, log)
+        log(f"FischAI {__version__}: reel detector on {controller.model.backend.name}")
+        events = queue.Queue()
+        hotkey = cfg.general.hotkey
+        HotkeyListener([hotkey], lambda _key: events.put("toggle")).start()
+        log(f"Ready. In Sober, stand facing water with the rod in hotbar slot 1 and press {hotkey.upper()} "
+            f"to start or stop. Ctrl+C quits.")
+        try:
+            while True:
                 try:
-                    cfg = _load_config()
-                    webhook = Webhook(cfg.webhook.url, log)
-                    session = Session(cfg, model, vision, io, log, lambda runner: events.put(runner))
-                except (hypr.WindowError, SystemExit) as e:
-                    log(str(e))
-                    session = None
-                    continue
-                session.start()
-                next_summary = time.time() + cfg.webhook.summary_min * 60
-                log("started")
-                webhook.send("Started fishing.")
-            elif event == "toggle":
-                finish("hotkey")
-            elif session is not None and event is session.runner:
-                finish("the macro ended")
-            if session is not None:
-                log.show_status(session.status_line())
-                if time.time() >= next_summary:
-                    next_summary = time.time() + cfg.webhook.summary_min * 60
-                    webhook.send(summary(session.stats))
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if session is not None:
-            finish("quit")
-        log.clear_status()
-        io.close()
+                    event = events.get(timeout=STATUS_REFRESH_S)
+                except queue.Empty:
+                    event = None
+                if event == "toggle":
+                    if controller.session is None:
+                        try:
+                            controller.cfg = _load_config()   # edits apply on the next start
+                        except SystemExit as e:
+                            log(str(e))
+                            continue
+                    controller.toggle()
+                controller.poll()
+                log.show_status(controller.session.status_line() if controller.session else "")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            log.clear_status()
+            controller.close()
 
 
 def _annotate(rgb, region, bar, fish):
@@ -321,7 +196,7 @@ def cmd_doctor(args):
     except config.ConfigError as e:
         check(False, "config", str(e))
         cfg = config.Config()
-    assets_ok = (MODEL_DIR / "model.json").is_file() and TEMPLATE_DIR.is_dir()
+    assets_ok = assets_installed()
     check(assets_ok, f"ExoPanda model and templates in {DATA_DIR}", "fischai setup /path/to/fisch-<version>.zip")
     if assets_ok:
         import numpy as np
@@ -335,7 +210,7 @@ def cmd_doctor(args):
             model.backend.run(tensor)
         ms = (time.perf_counter() - t0) * 100
         check(True, f"reel detector: {model.backend.name}, {ms:.0f} ms per frame")
-        _load_vision()
+        load_vision()
         check(True, "vision templates load")
     if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
         try:
@@ -351,6 +226,8 @@ def cmd_doctor(args):
 def main():
     parser = argparse.ArgumentParser(prog="fischai", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("gui", help="the settings window: start, stop and tune the macro")
+    p.set_defaults(func=cmd_gui)
     p = sub.add_parser("setup", help="install ExoPanda's reel model and templates from its Fisch module zip")
     p.add_argument("source", help="fisch-<version>.zip (Windows module) or the ExoPanda_Fischer.exe inside it")
     p.set_defaults(func=cmd_setup)

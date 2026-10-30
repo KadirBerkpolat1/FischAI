@@ -1,6 +1,7 @@
 """Settings in ~/.config/fischai/config.toml, written with defaults on first run.
 Defaults mirror ExoPanda Fischer's own (fisch.cfg)."""
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass, field, fields
@@ -18,49 +19,50 @@ DATA_DIR = _xdg("XDG_DATA_HOME", ".local/share")
 STATE_DIR = _xdg("XDG_STATE_HOME", ".local/state")
 CONFIG_PATH = CONFIG_DIR / "config.toml"
 
-DEFAULT_CONFIG = """\
-# FischAI settings. Read each time the macro starts (hotkey), so edits apply
-# on the next start. Stand facing water with the rod in hotbar slot 1.
+TEMPLATE = """\
+# FischAI settings. The settings window (`fischai gui`) rewrites this file and
+# applies changes at once; `fischai run` reads it each time the macro starts.
+# Stand facing water with the rod in hotbar slot 1.
 
 [general]
-hotkey = "f3"                    # start / stop
-window = "org.vinegarhq.Sober"   # window class, or a title substring
+hotkey = {general_hotkey}          # start / stop
+window = {general_window}          # window class, or a title substring
 
 [fishing]
-auto_cast = true
-auto_shake = true
-cast_hold_ms = 500               # how long the cast is held
-recast_delay_ms = 1500           # wait after a catch before casting again
+auto_cast = {fishing_auto_cast}
+auto_shake = {fishing_auto_shake}
+cast_hold_ms = {fishing_cast_hold_ms}          # how long the cast is held
+recast_delay_ms = {fishing_recast_delay_ms}    # wait after a catch before casting again
 
 [reel]
-auto_reel = true
-backend = "auto"                 # auto | ncnn | onnxruntime
-fps = 30                         # detection rate while fishing
-region = "auto"                  # or [x1, y1, x2, y2] as fractions of the game window
-rod = "normal"                   # normal | requiem
-aggressiveness_pct = 100         # how hard the bar chases the fish
-damping_pct = 100                # higher = gentler, less overshoot
-balance_pct = 0                  # raises the bar's top speed
-latency_ms = 0                   # 0 = measure; else fixed latency compensation
-learn = true                     # tune the reel gains per rod over time
+auto_reel = {reel_auto_reel}
+backend = {reel_backend}           # auto | ncnn | onnxruntime
+fps = {reel_fps}                   # detection rate while fishing
+region = {reel_region}             # "auto" or [x1, y1, x2, y2] as fractions of the game window
+rod = {reel_rod}                   # normal | requiem
+aggressiveness_pct = {reel_aggressiveness_pct}  # how hard the bar chases the fish
+damping_pct = {reel_damping_pct}   # higher = gentler, less overshoot
+balance_pct = {reel_balance_pct}   # raises the bar's top speed
+latency_ms = {reel_latency_ms}     # 0 = measure; else fixed latency compensation
+learn = {reel_learn}               # tune the reel gains per rod over time
 
 [totem]
-enabled = false
-day_slot = 0                     # hotbar 1-9, 0 = off (e.g. Sundial)
-night_slot = 0                   # hotbar 1-9, 0 = off (e.g. Aurora)
+enabled = {totem_enabled}
+day_slot = {totem_day_slot}        # hotbar 1-9, 0 = off (e.g. Sundial)
+night_slot = {totem_night_slot}    # hotbar 1-9, 0 = off (e.g. Aurora)
 
 [potions]
-enabled = false
-slots = [0, 0, 0, 0]             # hotbar slots, 0 = off
-interval_min = 30
-only_during_weather_event = false
+enabled = {potions_enabled}
+slots = {potions_slots}            # hotbar slots, 0 = off
+interval_min = {potions_interval_min}
+only_during_weather_event = {potions_only_during_weather_event}
 
 [aquarium]
-enabled = false                  # hourly feed; briefly resizes the game window to 1680x900
+enabled = {aquarium_enabled}       # hourly feed; briefly resizes the game window to 1680x900
 
 [webhook]
-url = ""                         # Discord webhook URL
-summary_min = 30
+url = {webhook_url}                # Discord webhook URL
+summary_min = {webhook_summary_min}
 """
 
 
@@ -167,10 +169,38 @@ def _validate(cfg):
     _check(cfg.webhook.summary_min >= 5, "webhook.summary_min must be at least 5")
 
 
+def _toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)   # JSON strings are valid TOML basic strings
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    raise TypeError(f"cannot write {value!r} to TOML")
+
+
+def render(cfg):
+    values = {}
+    for section in fields(Config):
+        obj = getattr(cfg, section.name)
+        for f in fields(obj):
+            values[f"{section.name}_{f.name}"] = _toml_value(getattr(obj, f.name))
+    return TEMPLATE.format(**values)
+
+
+def save(cfg, path=CONFIG_PATH):
+    _validate(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(render(cfg))
+    tmp.replace(path)
+
+
 def load(path=CONFIG_PATH):
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(DEFAULT_CONFIG)
+        save(Config(), path)
     try:
         raw = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as e:

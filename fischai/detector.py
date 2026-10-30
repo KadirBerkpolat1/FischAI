@@ -249,15 +249,16 @@ class DetectionRegion:
 
 class AiBridge(threading.Thread):
     """Captures the detection strip and runs the model in a loop, publishing
-    the newest Boxes. Runs at `fps` while the macro is in the shake or reel
-    phase and at `idle_fps` otherwise."""
+    the newest Boxes. Runs at `settings.fps` (read every frame, so it can be
+    changed live) while the macro is in the shake or reel phase and at
+    `idle_fps` otherwise."""
 
-    def __init__(self, model, window_rect, region, fps, idle_fps, log):
+    def __init__(self, model, window_rect, region, settings, idle_fps, log):
         super().__init__(daemon=True, name="reel-detector")
         self.model = model
         self.window_rect = window_rect      # callable -> (x, y, w, h) or None
         self.region = region
-        self.fps = fps
+        self.settings = settings
         self.idle_fps = idle_fps
         self.log = log
         self.active = False
@@ -274,7 +275,7 @@ class AiBridge(threading.Thread):
     def run(self):
         bar_t = fish_t = -math.inf
         while not self._stop_event.is_set():
-            period = 1.0 / (self.fps if self.active else self.idle_fps)
+            period = 1.0 / (self.settings.fps if self.active else self.idle_fps)
             win = self.window_rect()
             if win is None:
                 self._stop_event.wait(period)

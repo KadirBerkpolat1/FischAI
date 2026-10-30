@@ -8,17 +8,18 @@ import urllib.request
 
 
 class Webhook:
-    def __init__(self, url, log):
-        self.url = url.strip()
+    def __init__(self, settings, log):
+        self.settings = settings            # read on every send, so the URL can change live
         self.log = log
 
     def send(self, text):
-        if self.url:
-            threading.Thread(target=self._post, args=(text,), daemon=True, name="webhook").start()
+        url = self.settings.url.strip()
+        if url:
+            threading.Thread(target=self._post, args=(url, text), daemon=True, name="webhook").start()
 
-    def _post(self, text):
+    def _post(self, url, text):
         body = json.dumps({"content": text, "username": "FischAI"}).encode()
-        request = urllib.request.Request(self.url, body, {"Content-Type": "application/json", "User-Agent": "FischAI"})
+        request = urllib.request.Request(url, body, {"Content-Type": "application/json", "User-Agent": "FischAI"})
         try:
             urllib.request.urlopen(request, timeout=10).close()
         except (urllib.error.URLError, OSError) as e:
