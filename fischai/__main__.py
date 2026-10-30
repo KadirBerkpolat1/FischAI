@@ -281,12 +281,16 @@ def cmd_record(args):
     win = hypr.find_window(cfg.general.window)
     out = STATE_DIR / "recordings" / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True)
-    print(f"recording {win.width}x{win.height} every {1 / args.fps:.2f} s for {args.seconds:.0f} s into {out}")
+    print(f"recording {win.width}x{win.height} every {1 / args.fps:.2f} s for {args.seconds:.0f} s into {out} "
+          f"(only while the game is focused)")
     count = 0
     end = time.monotonic() + args.seconds
     try:
         while time.monotonic() < end:
             t0 = time.monotonic()
+            if hypr.active_address() != hypr.norm_address(win.address):
+                time.sleep(0.25)
+                continue
             win = hypr.refresh(win)
             frame = screen.grab(*win.rect)
             cv2.imwrite(str(out / f"{count:05d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))

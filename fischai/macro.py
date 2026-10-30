@@ -171,6 +171,35 @@ class Pointer:
         self.io.button(False)
 
 
+class ReelTelemetry:
+    """How well the detector saw one reel, for the log line at its end."""
+
+    def __init__(self):
+        self.frames = self.bar = self.fish = 0
+        self.bar_conf = self.fish_conf = 0.0
+        self.last_frame_t = None
+
+    def add(self, boxes):
+        if boxes.frame_t == self.last_frame_t:
+            return
+        self.last_frame_t = boxes.frame_t
+        self.frames += 1
+        if boxes.bar is not None:
+            self.bar += 1
+            self.bar_conf += boxes.bar.conf
+        if boxes.fish is not None:
+            self.fish += 1
+            self.fish_conf += boxes.fish.conf
+
+    def summary(self):
+        if not self.frames:
+            return "no detector frames"
+
+        def seen(name, n, conf):
+            return f"{name} in {n / self.frames:.0%} (avg {conf / n:.2f})" if n else f"{name} never seen"
+        return f"{self.frames} frames, {seen('bar', self.bar, self.bar_conf)}, {seen('fish', self.fish, self.fish_conf)}"
+
+
 @dataclass
 class Stats:
     started: float = field(default_factory=time.time)
@@ -309,6 +338,8 @@ class Macro:
         self.phase = "cast"
         self.reeling = False
         self.reel_started = -math.inf
+        self.reel_telemetry = ReelTelemetry()
+        self.cast_shake_clicks = 0
         self.reel_last_live = -math.inf
         self.consec_fish = 0
         self.shake_hint_frames = 0
@@ -363,7 +394,15 @@ class Macro:
         duration = now - self.reel_started
         if duration >= MIN_COUNTED_REEL_S:
             self.stats.reels += 1
-        self.log(f"reel over after {duration:.1f} s ({why}); reels so far: {self.stats.reels}")
+        self.log(f"reel over after {duration:.1f} s ({why}): {self.reel_telemetry.summary()}; "
+                 f"reels so far: {self.stats.reels}")
+
+    def _start_reel(self, now, how):
+        self.reeling = True
+        self.reel_started = now
+        self.reel_telemetry = ReelTelemetry()
+        self.phase = "reel"
+        self.log(f"reel: {how} after {self.cast_shake_clicks} shake click(s)")
 
     # -- main loop -------------------------------------------------------------
 
@@ -435,10 +474,8 @@ class Macro:
                 return
             self._mark_activity()
             if not self.reeling:
-                self.reel_started = now
-                self.log("reel: minigame detected")
-            self.reeling = True
-            self.phase = "reel"
+                self._start_reel(now, "minigame detected")
+            self.reel_telemetry.add(boxes)
             self.status("reel", self._reel_detail(boxes))
             if self.reeler.tick(boxes, now) == "ended":
                 self._end_reel(now, "bar stopped moving")
@@ -472,11 +509,8 @@ class Macro:
         self.shake_hint_frames = self.shake_hint_frames + 1 if box_live else 0
         if self.shake_hint_frames >= SHAKE_TO_REEL_HINT_TICKS:
             self.shake_hint_frames = 0
-            self.reeling = True
-            self.reel_started = now
             self.reel_last_live = now
-            self.phase = "reel"
-            self.log("reel: entered from a persistent box during shake")
+            self._start_reel(now, "entered from a persistent box during shake")
             return
         hit = None
         if self.cfg.fishing.auto_shake:
@@ -488,6 +522,7 @@ class Macro:
             result = self.shaker.click(self.win.x + hit[0], self.win.y + hit[1], suppress, now)
             if result == "clicked":
                 self.stats.shake_clicks += 1
+                self.cast_shake_clicks += 1
                 self.status("shake", f"clicked ({self.vision.shake.last_method})")
         else:
             result = self.shaker.wait(now)
@@ -531,6 +566,8 @@ class Macro:
         finally:
             self.io.button(False)
         self.stats.casts += 1
+        self.log(f"cast #{self.stats.casts}")
+        self.cast_shake_clicks = 0
         self.waiting_for_bite = True
         self.recast_anchor = None
         self.shake_clicked_this_cast = False
