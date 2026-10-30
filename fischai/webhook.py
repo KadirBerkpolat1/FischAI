@@ -29,6 +29,8 @@ class Webhook:
 def summary(stats):
     minutes = int((time.time() - stats.started) // 60)
     parts = [f"{stats.reels} reels", f"{stats.casts} casts"]
+    if stats.perfect_casts:
+        parts.append(f"{stats.perfect_casts} perfect casts")
     if stats.shake_timeouts:
         parts.append(f"{stats.shake_timeouts} casts without a bite")
     if stats.totems:

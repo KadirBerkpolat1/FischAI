@@ -217,6 +217,9 @@ class Window(QWidget):
 
         self._section("Balık tutma")
         self._switch("Oltayı kendisi atsın", c.fishing, "auto_cast")
+        self._switch("Perfect cast", c.fishing, "perfect_cast",
+                     hint="Güç çubuğunu izler, dolgu yeşil işarete gelince bırakır. Çubuk görünmezse "
+                          "aşağıdaki süre kadar basılı tutar.")
         self._slider("Atışta basılı tutma", c.fishing, "cast_hold_ms", 100, 2000, 50, "ms")
         self._slider("Yakaladıktan sonra bekleme", c.fishing, "recast_delay_ms", 100, 5000, 100, "ms")
         self._switch("Shake'e kendisi bassın", c.fishing, "auto_shake")
@@ -487,7 +490,8 @@ class Window(QWidget):
         if running:
             s = session.stats
             minutes = int((time.time() - s.started) // 60)
-            self.counters.setText(f"{s.reels} balık    {s.casts} atış    {minutes} dk    "
+            perfect = f" ({s.perfect_casts} perfect)" if self.cfg.fishing.perfect_cast else ""
+            self.counters.setText(f"{s.reels} balık    {s.casts} atış{perfect}    {minutes} dk    "
                                   f"algılama {session.bridge.frame_ms:.0f} ms")
         else:
             self.counters.setText(f"Kısayol: oyundayken {self.cfg.general.hotkey.upper()}")

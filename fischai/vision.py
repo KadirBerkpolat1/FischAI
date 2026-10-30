@@ -10,6 +10,7 @@ ExoPanda's templates from the data directory:
 All results are in frame pixels; the caller adds the window origin.
 """
 
+import subprocess
 from pathlib import Path
 
 import cv2
@@ -19,12 +20,32 @@ import numpy as np
 # of the client height (43 px at 1080, measured in Sober); until a confident
 # match pins the real size, sizes around that are tried. Matching runs at
 # half resolution.
-SHAKE_ROI = (0.04, 0.10, 0.92, 0.82)
+SHAKE_ROI = (0.02, 0.04, 0.96, 0.92)
 SHAKE_WORD_H = 43 / 1080
 SHAKE_SIZE_STEPS = (0.88, 1.0, 1.12)
 SHAKE_MATCH_SCALE = 0.5
 SHAKE_THRESH = 0.55             # real buttons score 0.65-0.9 at half resolution, anything else under 0.45
 SHAKE_PIN_THRESH = 0.70         # a match this good fixes the wordmark size for that client height
+
+# Cast power bar: a dark vertical bar right of the character with a thin
+# green marker on top. While the button is held the fill rises from the
+# bottom, reaches the marker ~0.45 s after the bar shows, falls back and
+# rises again; PERFECT needs the fill inside the marker on release. Measured
+# in Sober at 1880x998: bar column x 1076-1083, marker y ~425, bottom y ~646.
+POWER_ROI = (0.48, 0.25, 0.24, 0.50)        # x, y, w, h as fractions of the client
+POWER_GREEN_HSV = ((35, 110, 90), (85, 255, 255))
+POWER_MARKER_W = (6, 48)                    # px: a short, thin horizontal line
+POWER_MARKER_H = (2, 10)
+POWER_HALF_W = 3                            # half-width of the column read under the marker
+POWER_EMPTY_MAX_V = 95                      # the empty bar is dark (V 55-77) whatever is behind it
+POWER_FILL_MIN_V = 110                      # the fill is whitish (low saturation), V ~120-195
+POWER_FILL_MAX_S = 80
+POWER_SCAN = 0.30                           # how far below the marker the fill is read, share of the client height
+
+# The cast's grade ("Meh..", "Fine.", "Good!", "Great!", "Amazing!!",
+# "PERFECT!") is written over the character for about a second.
+CAST_TEXT_ROI = (0.38, 0.28, 0.24, 0.18)
+CAST_GRADES = ("perfect", "amazing", "great", "good", "fine", "meh")
 
 # HUD status icons, bottom-right quadrant.
 STATUS_ROI = (0.55, 0.50, 0.45, 0.48)
@@ -123,6 +144,70 @@ class ShakeDetector:
         if pinned is None and score >= SHAKE_PIN_THRESH:
             self._pinned[client_h] = factor
         return rx + x / SHAKE_MATCH_SCALE, ry + y / SHAKE_MATCH_SCALE
+
+
+class PowerBar:
+    """Reads the cast power bar from crops of POWER_ROI (see `crop`), one cast
+    at a time: find_marker() until the bar shows, then gap() per frame. In
+    Sober a release at gap <= 3 px graded PERFECT 3 times out of 3: the
+    fill keeps rising into the marker while the release reaches the game."""
+
+    def __init__(self, client_h):
+        self.scan = round(POWER_SCAN * client_h)
+        self.marker = None      # (column x, marker top y, marker bottom y) in crop px
+
+    @staticmethod
+    def crop(win_rect):
+        """Layout-pixel rectangle of the power bar search area."""
+        x, y, w, h = win_rect
+        fx, fy, fw, fh = POWER_ROI
+        return round(x + fx * w), round(y + fy * h), round(fw * w), round(fh * h)
+
+    def find_marker(self, rgb):
+        """The green marker with the dark empty bar under it, or None."""
+        green = cv2.inRange(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV), *POWER_GREEN_HSV)
+        n, _, stats, _ = cv2.connectedComponentsWithStats(green)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        best = None
+        for x, y, w, h, _area in stats[1:n]:
+            if not (POWER_MARKER_W[0] <= w <= POWER_MARKER_W[1] and POWER_MARKER_H[0] <= h <= POWER_MARKER_H[1]):
+                continue
+            cx = int(x + w // 2)
+            below = gray[y + h + 3:y + h + 30, max(0, cx - POWER_HALF_W):cx + POWER_HALF_W + 1]
+            if below.size and below.mean() <= POWER_EMPTY_MAX_V and (best is None or below.mean() < best[0]):
+                best = (below.mean(), cx, int(y), int(y + h))
+        if best is not None:
+            self.marker = best[1:]
+        return self.marker
+
+    def gap(self, rgb):
+        """Rows between the marker's bottom and the top of the fill (0 = the
+        fill reaches the marker), or None when no fill is in the scanned part."""
+        cx, top, bottom = self.marker
+        column = rgb[top:bottom + self.scan, max(0, cx - POWER_HALF_W):cx + POWER_HALF_W + 1]
+        hsv = cv2.cvtColor(column, cv2.COLOR_RGB2HSV)
+        filled = ((hsv[..., 2] >= POWER_FILL_MIN_V) & (hsv[..., 1] <= POWER_FILL_MAX_S)).mean(axis=1) > 0.5
+        runs = np.flatnonzero(filled[:-2] & filled[1:-1] & filled[2:])
+        if not runs.size:
+            return None
+        return max(0, int(runs[0]) - (bottom - top))
+
+
+def cast_text_crop(win_rect):
+    x, y, w, h = win_rect
+    fx, fy, fw, fh = CAST_TEXT_ROI
+    return round(x + fx * w), round(y + fy * h), round(fw * w), round(fh * h)
+
+
+def cast_grade(rgb):
+    """The cast grade word in a crop of CAST_TEXT_ROI ("perfect", …) or None (tesseract, ~0.1 s)."""
+    ok, png = cv2.imencode(".png", cv2.resize(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), None, fx=1.5, fy=1.5))
+    if not ok:
+        return None
+    out = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "11"], input=png.tobytes(),
+                         capture_output=True, check=False)
+    text = out.stdout.decode(errors="replace").lower()
+    return next((grade for grade in CAST_GRADES if grade in text), None)
 
 
 class CycleDetector:

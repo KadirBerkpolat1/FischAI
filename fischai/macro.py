@@ -15,7 +15,8 @@ import time
 from dataclasses import dataclass, field
 
 from . import hypr, recovery, screen
-from .reeler import Reeler
+from .reeler import REEL_LOCK_S, Reeler
+from .vision import PowerBar, cast_grade, cast_text_crop
 
 # Reel entry (fisch_data.lua, Windows values).
 STALE_S = 0.250
@@ -53,6 +54,15 @@ SHAKE_REARM_S = 0.300           # same spot, never seen gone: the click missed, 
 ROD_SLOT = "1"
 OTHER_SLOT = "2"
 EQUIP_STEP_S = 0.120
+
+# Perfect cast on the power bar (vision.PowerBar).
+CAST_BAR_WAIT_S = 0.5           # the bar shows ~0.14 s after the press
+CAST_MAX_S = 2.0
+CAST_ARM_GAP_PX = 40            # the fill must first be seen this far below the marker
+CAST_PERFECT_GAP_PX = 3         # released here, the fill is inside the marker when the game reads it
+CAST_LATE_GAP_PX = 25           # already falling this close to the top: release now, it only gets worse
+CAST_GRADE_READ_S = 1.4         # the grade text stays up about a second
+CAST_GRADE_POLL_S = 0.1
 ROD_REEQUIP_INTERVAL_S = 3600
 
 TOTEM_EQUIP_SETTLE_S = 0.65
@@ -222,8 +232,11 @@ class Snapshots:
 class ReelTelemetry:
     """How well the detector saw one reel, for the log line at its end."""
 
-    def __init__(self):
-        self.frames = self.bar = self.fish = self.both = self.inside = 0
+    def __init__(self, start):
+        self.start = start
+        self.frames = self.bar = self.fish = 0
+        self.both = [0, 0]      # frames with both boxes: while the minigame ignores input, after
+        self.inside = [0, 0]
         self.bar_conf = self.fish_conf = 0.0
         self.last_frame_t = None
 
@@ -240,8 +253,9 @@ class ReelTelemetry:
             self.fish += 1
             self.fish_conf += fish.conf
         if bar is not None and fish is not None:
-            self.both += 1
-            self.inside += bar.x <= fish.cx <= bar.x + bar.w
+            k = int(boxes.frame_t - self.start >= REEL_LOCK_S)
+            self.both[k] += 1
+            self.inside[k] += bar.x <= fish.cx <= bar.x + bar.w
 
     def summary(self):
         if not self.frames:
@@ -249,9 +263,13 @@ class ReelTelemetry:
 
         def seen(name, n, conf):
             return f"{name} in {n / self.frames:.0%} (avg {conf / n:.2f})" if n else f"{name} never seen"
+
         text = f"{self.frames} frames, {seen('bar', self.bar, self.bar_conf)}, {seen('fish', self.fish, self.fish_conf)}"
-        if self.both:
-            text += f", fish inside the bar {self.inside / self.both:.0%}"
+        if sum(self.both):
+            text += f", fish inside the bar {sum(self.inside) / sum(self.both):.0%}"
+        if all(self.both):
+            text += (f" (first {REEL_LOCK_S:g} s {self.inside[0] / self.both[0]:.0%}, "
+                     f"then {self.inside[1] / self.both[1]:.0%})")
         return text
 
 
@@ -263,6 +281,7 @@ class Stats:
     shake_clicks: int = 0
     shake_timeouts: int = 0
     totems: int = 0
+    perfect_casts: int = 0
     potion_rounds: int = 0
     aquarium_sweeps: int = 0
     rejoins: int = 0
@@ -413,7 +432,7 @@ class Macro:
         self.phase = "cast"
         self.reeling = False
         self.reel_started = -math.inf
-        self.reel_telemetry = ReelTelemetry()
+        self.reel_telemetry = ReelTelemetry(self.reel_started)
         self.cast_shake_clicks = 0
         self.cast_t = -math.inf
         self.last_bar_seen = -math.inf
@@ -498,7 +517,7 @@ class Macro:
     def _start_reel(self, now, how):
         self.reeling = True
         self.reel_started = now
-        self.reel_telemetry = ReelTelemetry()
+        self.reel_telemetry = ReelTelemetry(now)
         self.phase = "reel"
         since_cast = f" in {now - self.cast_t:.1f} s" if self.cast_t > 0 else ""
         # The button jumps after every shake the game accepts, so many clicks
@@ -740,13 +759,17 @@ class Macro:
         self._snap("cast")
         x, y = self.win.center
         self.pointer.warp(x, y)
+        bar = PowerBar(self.win.height) if self.cfg.fishing.perfect_cast else None
         self.io.button(True)
         try:
-            self.sleep(self.cfg.fishing.cast_hold_ms / 1000)
+            how = self._hold_for_cast(bar)
         finally:
             self.io.button(False)
         self.stats.casts += 1
-        self.log(f"cast #{self.stats.casts}")
+        self.log(f"cast #{self.stats.casts}: {how}")
+        if bar is not None:
+            threading.Thread(target=self._read_cast_grade, args=(self.stats.casts, self.rect),
+                             daemon=True, name="cast-grade").start()
         self.cast_t = time.monotonic()
         self.cast_shake_clicks = 0
         self.waiting_for_bite = True
@@ -754,6 +777,55 @@ class Macro:
         self.shake_hint_frames = 0
         self.shaker.reset()
         self.phase = "shake"
+
+    def _hold_for_cast(self, bar):
+        """Keep the button held until the release, returning how it was timed.
+        With the power bar: release once the rising fill is within
+        CAST_PERFECT_GAP_PX of the green marker. Without it, or when the bar
+        does not show, the timed hold."""
+        hold_s = self.cfg.fishing.cast_hold_ms / 1000
+        start = time.monotonic()
+        if bar is None:
+            self.sleep(hold_s)
+            return f"held {hold_s:.2f} s"
+        crop = PowerBar.crop(self.rect)
+        armed = seen_fill = False
+        prev = None
+        while True:
+            if self.stop_event.is_set():
+                raise Stopped
+            now = time.monotonic()
+            t = now - start
+            if t > CAST_MAX_S:
+                return f"held {t:.2f} s, the fill never reached the marker"
+            rgb = screen.grab(*crop)
+            if bar.marker is None and bar.find_marker(rgb) is None:
+                if t >= max(CAST_BAR_WAIT_S, hold_s):
+                    return f"held {t:.2f} s, no power bar seen"
+                continue
+            gap = bar.gap(rgb)
+            if gap is None:
+                if not seen_fill and t >= max(CAST_BAR_WAIT_S, hold_s):
+                    return f"held {t:.2f} s, the power bar's fill was not readable"
+                continue
+            seen_fill = True
+            armed = armed or gap >= CAST_ARM_GAP_PX
+            if armed and (gap <= CAST_PERFECT_GAP_PX or (prev is not None and gap > prev and gap <= CAST_LATE_GAP_PX)):
+                return f"released at {t:.2f} s, {gap} px below the marker"
+            prev = gap
+
+    def _read_cast_grade(self, number, rect):
+        """Log the grade Fisch writes over the character after a cast."""
+        crop = cast_text_crop(rect)
+        end = time.monotonic() + CAST_GRADE_READ_S
+        while time.monotonic() < end and not self.stop_event.is_set():
+            grade = cast_grade(screen.grab(*crop))
+            if grade is not None:
+                if grade == "perfect":
+                    self.stats.perfect_casts += 1
+                self.log(f"cast #{number}: {grade.upper()}")
+                return
+            time.sleep(CAST_GRADE_POLL_S)
 
     # -- totem (fisch_totem.lua) ---------------------------------------------------
 

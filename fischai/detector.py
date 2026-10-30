@@ -248,10 +248,12 @@ class DetectionRegion:
 
 
 class AiBridge(threading.Thread):
-    """Captures the detection strip and runs the model in a loop, publishing
-    the newest Boxes. Runs at `settings.fps` (read every frame, so it can be
-    changed live) while the macro is in the shake or reel phase and at
-    `idle_fps` otherwise."""
+    """Runs the model on the newest capture of the detection strip and
+    publishes the newest Boxes. Capturing (~8 ms) runs in its own thread, so
+    it overlaps inference (~14 ms on the GPU) and the rate is set by the
+    slower of the two instead of their sum. Captures come at `settings.fps`
+    (read every frame, so it can be changed live) while the macro is in the
+    shake or reel phase and at `idle_fps` otherwise."""
 
     def __init__(self, model, window_rect, region, settings, idle_fps, log):
         super().__init__(daemon=True, name="reel-detector")
@@ -263,17 +265,25 @@ class AiBridge(threading.Thread):
         self.log = log
         self.active = False
         self.latest = Boxes()
-        self.frame_ms = 0.0
+        self.frame_ms = 0.0                 # inference time per frame
         self.error = None
         self._stop_event = threading.Event()
         self._bar_track = _BoxTracker()
         self._fish_track = _BoxTracker()
+        self._capture = None                # (rgb, rx, ry, window rect, capture time), newest not yet inferred
+        self._captured = threading.Condition()
 
     def stop(self):
         self._stop_event.set()
+        with self._captured:
+            self._captured.notify()
 
-    def run(self):
-        bar_t = fish_t = -math.inf
+    def _report(self, error):
+        if str(error) != self.error:
+            self.error = str(error)
+            self.log(f"detector error: {error}")
+
+    def _capture_loop(self):
         while not self._stop_event.is_set():
             period = 1.0 / (self.settings.fps if self.active else self.idle_fps)
             win = self.window_rect()
@@ -283,11 +293,32 @@ class AiBridge(threading.Thread):
             rx, ry, rw, rh = self.region.rect(win)
             t0 = time.monotonic()
             try:
-                bar, fish = self.model.predict(screen.grab(rx, ry, rw, rh))
+                rgb = screen.grab(rx, ry, rw, rh)
             except Exception as e:  # keep the thread alive; the macro reports it
-                if str(e) != self.error:
-                    self.error = str(e)
-                    self.log(f"detector error: {e}")
+                self._report(e)
+                self._stop_event.wait(0.5)
+                continue
+            with self._captured:
+                self._capture = (rgb, rx, ry, win, t0)
+                self._captured.notify()
+            self._stop_event.wait(max(0.0, period - (time.monotonic() - t0)))
+
+    def run(self):
+        threading.Thread(target=self._capture_loop, daemon=True, name="reel-capture").start()
+        bar_t = fish_t = -math.inf
+        while not self._stop_event.is_set():
+            with self._captured:
+                while self._capture is None and not self._stop_event.is_set():
+                    self._captured.wait()
+                capture, self._capture = self._capture, None
+            if capture is None:
+                continue
+            rgb, rx, ry, win, t0 = capture
+            started = time.monotonic()
+            try:
+                bar, fish = self.model.predict(rgb)
+            except Exception as e:  # keep the thread alive; the macro reports it
+                self._report(e)
                 self._stop_event.wait(0.5)
                 continue
             self.error = None
@@ -300,9 +331,7 @@ class AiBridge(threading.Thread):
             if fish is not None:
                 fish_t = t0
             self.latest = Boxes(bar, fish, bar_t, fish_t, t0)
-            elapsed = time.monotonic() - t0
-            self.frame_ms += 0.1 * (elapsed * 1000 - self.frame_ms)
-            self._stop_event.wait(max(0.0, period - elapsed))
+            self.frame_ms += 0.1 * ((time.monotonic() - started) * 1000 - self.frame_ms)
 
 
 def _shift(box, dx, dy):

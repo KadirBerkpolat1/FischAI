@@ -32,7 +32,8 @@ debug_snapshots = {general_debug_snapshots}  # save what the macro saw at each c
 [fishing]
 auto_cast = {fishing_auto_cast}
 auto_shake = {fishing_auto_shake}
-cast_hold_ms = {fishing_cast_hold_ms}          # how long the cast is held
+perfect_cast = {fishing_perfect_cast}          # release when the power bar's fill reaches the green marker
+cast_hold_ms = {fishing_cast_hold_ms}          # how long the cast is held when the power bar is not used
 recast_delay_ms = {fishing_recast_delay_ms}    # wait after a catch before casting again
 
 [reel]
@@ -81,6 +82,7 @@ class General:
 class Fishing:
     auto_cast: bool = True
     auto_shake: bool = True
+    perfect_cast: bool = True
     cast_hold_ms: int = 500
     recast_delay_ms: int = 1500
 
@@ -89,7 +91,7 @@ class Fishing:
 class Reel:
     auto_reel: bool = True
     backend: str = "auto"
-    fps: int = 30
+    fps: int = 60
     region: object = "auto"
     rod: str = "normal"
     aggressiveness_pct: int = 100
