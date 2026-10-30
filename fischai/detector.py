@@ -32,12 +32,13 @@ DEFAULT_REGION = (0.21, 0.76, 0.79, 0.96)
 RECENTER_SAMPLES = 15            # confident bar sightings before the strip re-centres on them
 RECENTER_MIN_CONF = 0.6
 
-# Box tracker: one-euro smoothing of each class's centre, plus a jump gate
-# that holds back a single-frame teleport until the next frame confirms it.
-EURO_MIN_CUTOFF_HZ = 3.0
-EURO_BETA = 0.05
-EURO_D_CUTOFF_HZ = 1.0
-MAX_SPEED_PX_S = 6000.0
+# Box tracker, ExoPanda's tracker.rs constants: one-euro filters on each
+# class's centre and size, and a cap on centre motion that gives way after
+# two consecutive capped frames (a real jump, not a misdetection).
+CENTER_FILTER = (1.2, 0.015, 1.0)    # min cutoff Hz, beta, derivative cutoff Hz
+SIZE_FILTER = (1.0, 0.0, 1.0)
+MAX_SPEED_PX_S = 2500.0
+MAX_CONSECUTIVE_CAPS = 2
 TRACK_RESET_S = 0.5
 
 
@@ -73,14 +74,17 @@ class Boxes:
 
 
 def letterbox(rgb):
-    """Ultralytics-style letterbox: keep aspect, pad to a centred 640x640 with
-    grey 114. Returns the CHW float32 tensor, the scale and the padding."""
+    """ExoPanda's preprocessing (inference.rs): scale = min(640/w, 640/h),
+    centred on a 640x640 grey-114 RGB canvas with integer (640 - n) // 2
+    padding, then x/255 into planar CHW. Returns the tensor, scale and padding."""
     h, w = rgb.shape[:2]
     scale = INPUT_SIZE / max(w, h)
     new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
     canvas = np.full((INPUT_SIZE, INPUT_SIZE, 3), LETTERBOX_FILL, dtype=np.uint8)
     pad_x, pad_y = (INPUT_SIZE - new_w) // 2, (INPUT_SIZE - new_h) // 2
-    canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    # Their resize is a weighted (antialiased) filter; INTER_AREA is the closest OpenCV match when shrinking.
+    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = cv2.resize(rgb, (new_w, new_h), interpolation=interpolation)
     tensor = np.ascontiguousarray(canvas.transpose(2, 0, 1), dtype=np.float32)
     tensor *= 1 / 255
     return tensor, scale, pad_x, pad_y
@@ -163,42 +167,55 @@ class ReelModel:
         return Box((cx - w / 2 - pad_x) / scale, (cy - h / 2 - pad_y) / scale, w / scale, h / scale, conf)
 
 
-class _CenterTrack:
-    """One-euro filter on a box centre plus a teleport gate: a jump faster than
-    MAX_SPEED_PX_S is held back until a second frame lands near it."""
-
-    def __init__(self):
-        self.t = None
-        self.x = self.y = self.dx = 0.0
-        self.pending = None
+class _OneEuro:
+    def __init__(self, min_cutoff, beta, d_cutoff):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.x = None
+        self.dx = 0.0
 
     @staticmethod
     def _alpha(dt, cutoff):
         return 1.0 / (1.0 + 1.0 / (2 * math.pi * cutoff * dt))
 
+    def __call__(self, x, dt):
+        if self.x is None:
+            self.x = x
+            return x
+        self.dx += self._alpha(dt, self.d_cutoff) * ((x - self.x) / dt - self.dx)
+        self.x += self._alpha(dt, self.min_cutoff + self.beta * abs(self.dx)) * (x - self.x)
+        return self.x
+
+
+class _BoxTracker:
+    def __init__(self):
+        self.t = None
+        self._reset()
+
+    def _reset(self):
+        self.cx, self.cy = _OneEuro(*CENTER_FILTER), _OneEuro(*CENTER_FILTER)
+        self.w, self.h = _OneEuro(*SIZE_FILTER), _OneEuro(*SIZE_FILTER)
+        self.caps = 0
+
     def update(self, box, t):
         if box is None:
             return None
         cx, cy = box.cx, box.cy
-        if self.t is None or t - self.t > TRACK_RESET_S:
-            self.t, self.x, self.y, self.dx, self.pending = t, cx, cy, 0.0, None
-            return box
-        dt = max(t - self.t, 1e-3)
-        if abs(cx - self.x) / dt > MAX_SPEED_PX_S:
-            confirmed = self.pending is not None and abs(cx - self.pending) / dt <= MAX_SPEED_PX_S
-            if not confirmed:
-                self.pending = cx
-                return None
-            self.t, self.x, self.y, self.dx, self.pending = t, cx, cy, 0.0, None
-            return box
-        self.pending = None
-        a_d = self._alpha(dt, EURO_D_CUTOFF_HZ)
-        self.dx += a_d * ((cx - self.x) / dt - self.dx)
-        a = self._alpha(dt, EURO_MIN_CUTOFF_HZ + EURO_BETA * abs(self.dx))
-        self.x += a * (cx - self.x)
-        self.y += a * (cy - self.y)
+        dt = None if self.t is None else t - self.t
+        if dt is None or dt <= 0 or dt > TRACK_RESET_S:
+            self._reset()
+        else:
+            dx, dy = cx - self.cx.x, cy - self.cy.x
+            dist = math.hypot(dx, dy)
+            limit = MAX_SPEED_PX_S * dt
+            if dist > limit and self.caps < MAX_CONSECUTIVE_CAPS:
+                self.caps += 1
+                cx, cy = self.cx.x + dx * limit / dist, self.cy.x + dy * limit / dist
+            else:
+                self.caps = 0
         self.t = t
-        return Box(self.x - box.w / 2, self.y - box.h / 2, box.w, box.h, box.conf)
+        fx, fy = self.cx(cx, dt), self.cy(cy, dt)
+        fw, fh = max(self.w(box.w, dt), 1.0), max(self.h(box.h, dt), 1.0)
+        return Box(fx - fw / 2, fy - fh / 2, fw, fh, box.conf)
 
 
 class DetectionRegion:
@@ -248,8 +265,8 @@ class AiBridge(threading.Thread):
         self.frame_ms = 0.0
         self.error = None
         self._stop_event = threading.Event()
-        self._bar_track = _CenterTrack()
-        self._fish_track = _CenterTrack()
+        self._bar_track = _BoxTracker()
+        self._fish_track = _BoxTracker()
 
     def stop(self):
         self._stop_event.set()
