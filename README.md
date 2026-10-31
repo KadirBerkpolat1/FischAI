@@ -22,12 +22,14 @@ available and from the screen otherwise.
 - [uv](https://docs.astral.sh/uv/) (or any Python ≥ 3.12 environment)
 - The ExoPanda Fisch module zip (`fisch-<version>.zip`) — **not included**;
   you supply your own copy for `fischai setup`
-- Permissions (one-time):
+- Permissions (one-time): the settings window offers to set these up on
+  first run — one `pkexec` password prompt; it joins you to the `input`
+  group, writes `/etc/udev/rules.d/99-fischai.rules` (uaccess), and ACLs the
+  live device nodes so it works without re-logging in. By hand:
   ```sh
   sudo usermod -aG input "$USER"          # read the keyboard for the hotkey
-  echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uinput.rules
+  echo 'KERNEL=="uinput", GROUP="input", MODE="0660", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/99-fischai.rules
   sudo udevadm control --reload-rules && sudo udevadm trigger
-  # then log out and back in
   ```
 
 ## Install

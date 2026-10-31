@@ -721,6 +721,37 @@ def main():
         QMessageBox.warning(None, "FischAI", str(e))
 
 
+def _offer_perm_setup(window):
+    """First run on a fresh machine: offer to set up the /dev/input and
+    /dev/uinput permissions as root (one pkexec password prompt)."""
+    import getpass
+
+    from . import perms
+
+    lack = perms.missing()
+    if not lack:
+        return
+    listed = "\n".join(f"• {item}" for item in lack)
+    answer = QMessageBox.question(
+        window, "İzin kurulumu",
+        f"Şunlar eksik, bunlar olmadan kısayol ve tıklamalar çalışmaz:\n{listed}\n\n"
+        "Kurulum şunları yapar: kullanıcın 'input' grubuna eklenir, "
+        f"{perms.RULE_PATH} kuralı yazılır ve bu oturum için aygıtlara erişim açılır. "
+        "Yönetici parolası sorulacak. Şimdi kurayım mı?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    if answer != QMessageBox.StandardButton.Yes:
+        return
+    ok, message = perms.fix(getpass.getuser())
+    if ok and not perms.missing():
+        QMessageBox.information(window, "İzin kurulumu", "İzinler kuruldu; kısayol ve tıklamalar çalışır durumda.")
+    elif ok:
+        QMessageBox.information(window, "İzin kurulumu",
+                                "Kurulum yapıldı ama bazı izinler hâlâ eksik görünüyor. "
+                                "Oturumu kapatıp yeniden açmak gerekebilir.")
+    else:
+        QMessageBox.warning(window, "İzin kurulumu", message)
+
+
 def _run(app, cfg, palette):
     from .inputdev import HotkeyListener
 
@@ -729,6 +760,7 @@ def _run(app, cfg, palette):
     window.start_button.setEnabled(False)
     window.show()
     app.processEvents()
+    _offer_perm_setup(window)
     if not assets_installed() and not _ask_for_module(window, log):
         window.error_text = "ExoPanda modülü kurulmadan başlatılamaz."
         app.exec()
