@@ -369,6 +369,7 @@ class Window(QWidget):
             self.grid.setRowStretch(self.row, 1)
         page = QWidget()
         self.grid = QGridLayout(page)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.grid.setContentsMargins(0, 0, 8, 0)
         self.grid.setHorizontalSpacing(14)
         self.grid.setVerticalSpacing(8)
