@@ -1,0 +1,16 @@
+#!/bin/sh
+# FischAI AppImage entry: bundled Python + model, grim/tesseract alongside.
+APPDIR="$(dirname "$(readlink -f "$0")")"
+export PATH="$APPDIR/usr/bin:$APPDIR/usr/python/bin:$PATH"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TESSDATA_PREFIX="$APPDIR/usr/share/tessdata"
+
+# First run: seed the reel model and templates the app expects in its data dir.
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/fischai"
+if [ ! -f "$DATA/model/model.json" ]; then
+    mkdir -p "$DATA"
+    cp -r "$APPDIR/usr/share/fischai-seed/model" "$APPDIR/usr/share/fischai-seed/templates" "$DATA/"
+fi
+
+[ $# -eq 0 ] && set -- gui
+exec "$APPDIR/usr/python/bin/fischai" "$@"

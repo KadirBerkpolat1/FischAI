@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=FischAI
+Comment=Fisch (Roblox) fishing macro for Sober on Hyprland
+Exec=fischai gui
+Icon=fischai
+Categories=Game;Utility;
+Terminal=false
