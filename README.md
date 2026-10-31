@@ -87,4 +87,6 @@ rewritten by the settings window. Logs and state live under
 
 ## License
 
-No license file yet — all rights reserved by the author until one is added.
+[MIT](LICENSE) — © 2026 Kadir Berk Polat. The ExoPanda model and templates
+installed by `fischai setup` are not part of this repository and remain
+under their own terms.
