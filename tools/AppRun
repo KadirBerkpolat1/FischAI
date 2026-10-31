@@ -13,4 +13,6 @@ if [ ! -f "$DATA/model/model.json" ]; then
 fi
 
 [ $# -eq 0 ] && set -- gui
-exec "$APPDIR/usr/python/bin/fischai" "$@"
+# Not bin/fischai: pip writes the build machine's absolute Python path into
+# that script's shebang, which does not exist anywhere else.
+exec "$APPDIR/usr/python/bin/python3" -m fischai "$@"
