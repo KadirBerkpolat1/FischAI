@@ -241,6 +241,35 @@ def cast_grade(rgb):
     return next((grade for grade in CAST_GRADES if grade in text), None)
 
 
+def appraise_row(rgb):
+    """(x, y) centre of the NPC dialog's appraise option in a full game-window
+    frame, or None (tesseract TSV, ~1 s). The dialog rides on the NPC as a
+    BillboardGui, so where it lands on screen follows the camera; only the
+    text is stable."""
+    gray = cv2.resize(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), None, fx=1.5, fy=1.5)
+    ok, png = cv2.imencode(".png", gray)
+    if not ok:
+        return None
+    out = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "11", "tsv"], input=png.tobytes(),
+                         capture_output=True, check=False)
+    lines = {}
+    for row in out.stdout.decode(errors="replace").splitlines()[1:]:
+        f = row.split("\t")
+        if len(f) < 12 or not f[11].strip():
+            continue
+        try:
+            x, y, w, h = (int(float(f[i])) for i in (6, 7, 8, 9))
+        except ValueError:
+            continue
+        lines.setdefault(tuple(f[2:5]), []).append((x, y, w, h, f[11].lower()))
+    for words in lines.values():
+        text = " ".join(w[-1] for w in words)
+        if "appraise" in text and ("c$" in text or "again" in text):
+            return (round((min(w[0] for w in words) + max(w[0] + w[2] for w in words)) / 2 / 1.5),
+                    round((min(w[1] for w in words) + max(w[1] + w[3] for w in words)) / 2 / 1.5))
+    return None
+
+
 class CycleDetector:
     """Two-stage day/night read of the HUD icon. Stage 1 locates the icon as the
     best match of any template; stage 2 scores day vs night only around that

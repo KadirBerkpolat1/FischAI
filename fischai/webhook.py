@@ -38,6 +38,8 @@ def summary(stats):
         parts.append(f"{stats.shake_timeouts} casts without a bite")
     if stats.totems:
         parts.append(f"{stats.totems} totems")
+    if stats.appraisals:
+        parts.append(f"{stats.appraisals} appraisals")
     if stats.potion_rounds:
         parts.append(f"{stats.potion_rounds} potion rounds")
     if stats.aquarium_sweeps:

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
     QButtonGroup,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -59,7 +60,7 @@ CAST_GRADE_CHOICES = (("meh", "Meh"), ("fine", "Fine"), ("good", "Good"),
 
 # The fishing cycle shown at the top; idle-chain phases count as casting.
 STEPS = ("Atış", "Shake", "Çekme")
-STEP_OF_PHASE = {"starting": 0, "cast": 0, "idle": 0, "totem": 0, "potions": 0, "aquarium": 0, "shake": 1, "reel": 2}
+STEP_OF_PHASE = {"starting": 0, "cast": 0, "idle": 0, "totem": 0, "appraise": 0, "potions": 0, "aquarium": 0, "shake": 1, "reel": 2}
 
 
 def load_palette():
@@ -255,6 +256,17 @@ class Window(QWidget):
         self._slot("Gündüz yedek slotu", c.totem, "day_slot")
         self._slot("Gece yedek slotu", c.totem, "night_slot")
 
+        self._section("Appraise")
+        self._switch("Appraise et", c.appraise, "enabled",
+                     hint="Appraiser NPC'sinin önüne kendin git, balığı eline alıp diyaloğu aç, sonra makroyu "
+                          "başlat. Makro diyaloğun 1. seçeneğini seçip istenen mutasyon ve ağırlık gelene ya da "
+                          "deneme sayısı dolana kadar tekrarlar; her deneme oyun parası harcar. Appraise açıkken "
+                          "balık atılmaz, totem ve iksir çalışmaz.")
+        self._slot("Balık slotu", c.appraise, "slot")
+        self._text("İstenen mutasyon", c.appraise, "mutation", "örn. Shiny — boşsa fark etmez")
+        self._decimal("En az ağırlık", c.appraise, "min_weight_kg", 0.0, 100000.0, 0.5, "kg")
+        self._slider("En fazla deneme", c.appraise, "max_attempts", 1, 500, 5, "deneme")
+
         self._section("İksir")
         self._switch("İksir kullan", c.potions, "enabled")
         self._potion_slots()
@@ -334,6 +346,21 @@ class Window(QWidget):
 
     def _slot(self, label, target, attr):
         box = self._slot_box(getattr(target, attr))
+        box.valueChanged.connect(lambda v: self._set(target, attr, v))
+        holder = QHBoxLayout()
+        holder.setContentsMargins(0, 0, 0, 0)
+        holder.addStretch(1)
+        holder.addWidget(box)
+        wrapper = QWidget()
+        wrapper.setLayout(holder)
+        self._place(label, wrapper)
+
+    def _decimal(self, label, target, attr, lo, hi, step, unit):
+        box = QDoubleSpinBox(minimum=lo, maximum=hi, singleStep=step, decimals=2,
+                             alignment=Qt.AlignmentFlag.AlignCenter)
+        box.setValue(getattr(target, attr))
+        box.setSuffix(f" {unit}")
+        box.setFixedWidth(110)
         box.valueChanged.connect(lambda v: self._set(target, attr, v))
         holder = QHBoxLayout()
         holder.setContentsMargins(0, 0, 0, 0)
@@ -543,6 +570,7 @@ class Window(QWidget):
             "starting": "Başlıyor: olta ele alınıyor",
             "cast": "Atış",
             "totem": "Totem kullanılıyor",
+            "appraise": "Appraise ediliyor",
             "potions": "İksir içiliyor",
             "aquarium": "Akvaryum besleniyor",
             "recovery": "Bağlantı koptu: Sober yeniden açılıp Fisch'e giriliyor",

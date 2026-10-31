@@ -59,6 +59,13 @@ night_name = {totem_night_name}    # same, by night (e.g. Aurora)
 day_slot = {totem_day_slot}        # fallback hotbar 1-9 when the hotbar cannot be read, 0 = off
 night_slot = {totem_night_slot}    # fallback hotbar 1-9, 0 = off
 
+[appraise]
+enabled = {appraise_enabled}       # at the Appraiser NPC with the dialog open, re-appraise the fish in the slot below
+slot = {appraise_slot}             # hotbar slot of the fish
+mutation = {appraise_mutation}     # stop when the fish's name contains this (case-insensitive); empty = any
+min_weight_kg = {appraise_min_weight_kg}  # stop at or above this weight in kg; 0 = any
+max_attempts = {appraise_max_attempts}    # hard stop: every attempt costs C$
+
 [potions]
 enabled = {potions_enabled}
 slots = {potions_slots}            # hotbar slots, 0 = off
@@ -118,6 +125,15 @@ class Totem:
 
 
 @dataclass
+class Appraise:
+    enabled: bool = False
+    slot: int = 2
+    mutation: str = ""
+    min_weight_kg: float = 0.0
+    max_attempts: int = 50
+
+
+@dataclass
 class Potions:
     enabled: bool = False
     slots: list = field(default_factory=lambda: [0, 0, 0, 0])
@@ -147,6 +163,7 @@ class Config:
     fishing: Fishing = field(default_factory=Fishing)
     reel: Reel = field(default_factory=Reel)
     totem: Totem = field(default_factory=Totem)
+    appraise: Appraise = field(default_factory=Appraise)
     potions: Potions = field(default_factory=Potions)
     aquarium: Aquarium = field(default_factory=Aquarium)
     recovery: Recovery = field(default_factory=Recovery)
@@ -185,6 +202,10 @@ def _validate(cfg):
                'reel.region must be "auto" or [x1, y1, x2, y2] with 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1')
     for name in ("day_slot", "night_slot"):
         _check(0 <= getattr(cfg.totem, name) <= 9, f"totem.{name} must be 0-9")
+    a = cfg.appraise
+    _check(1 <= a.slot <= 9, "appraise.slot must be 1-9")
+    _check(0 <= a.min_weight_kg <= 1_000_000, "appraise.min_weight_kg must be 0-1000000")
+    _check(1 <= a.max_attempts <= 10000, "appraise.max_attempts must be 1-10000")
     p = cfg.potions
     _check(isinstance(p.slots, list) and len(p.slots) <= 4 and all(isinstance(s, int) and 0 <= s <= 9 for s in p.slots),
            "potions.slots must be up to four hotbar numbers 0-9")
@@ -241,6 +262,8 @@ def load(path=CONFIG_PATH):
                 _check(isinstance(value, bool), f"{section}.{key} must be true or false")
             elif isinstance(default, int):
                 _check(isinstance(value, int) and not isinstance(value, bool), f"{section}.{key} must be a whole number")
+            elif isinstance(default, float):
+                _check(isinstance(value, (int, float)) and not isinstance(value, bool), f"{section}.{key} must be a number")
             elif isinstance(default, str) and key != "region":
                 _check(isinstance(value, str), f"{section}.{key} must be text")
             setattr(target, key, value)

@@ -435,8 +435,9 @@ class FischUI(RobloxMemory):
         return p, f, progress
 
     def hotbar(self):
-        """{slot: (item name, stack count or None)} for the occupied hotbar
-        slots, or None when the hotbar cannot be read now."""
+        """{slot: (item name, stack count or None, weight in kg or None)} for
+        the occupied hotbar slots, or None when the hotbar cannot be read
+        now. Only fish frames carry a Weight label ("5Kg", "1.2T")."""
         bar = self.gui("backpack", "hotbar")
         if not bar:
             return None
@@ -451,8 +452,27 @@ class FischUI(RobloxMemory):
                 continue
             stack = self.child(frame, "Stack")
             digits = re.search(r"\d+", self.text(stack) or "") if stack else None
-            items[int(slot)] = (name, int(digits.group()) if digits else None)
+            weight_label = self.child(frame, "Weight")
+            weight = None
+            if weight_label:
+                m = re.search(r"([\d]+(?:[.,]\d+)?)\s*(kg|t)", (self.text(weight_label) or "").lower())
+                if m:
+                    weight = float(m.group(1).replace(",", ".")) * (1000.0 if m.group(2) == "t" else 1.0)
+            items[int(slot)] = (name, int(digits.group()) if digits else None, weight)
         return items or None
+
+    def appraise_option(self):
+        """The price in C$ while the NPC dialog's first option offers an
+        appraisal ("Can you appraise it again? [45 C$]"; 0 when the text
+        carries no price), or None when it offers something else."""
+        label = self.gui("options", "safezone", "1option", "text")
+        if not label:
+            return None
+        text = " ".join(re.sub(r"<[^>]+>", " ", self.text(label) or "").split()).lower()
+        if "appraise" not in text:
+            return None
+        m = re.search(r"([\d,]+)\s*c\$", text)
+        return int(m.group(1).replace(",", "")) if m else 0
 
     def _hrp(self):
         if self._character is None or self.name(self._character) != self.player_name:

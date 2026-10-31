@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from . import hypr, recovery, screen
 from .detector import Box, Boxes
 from .reeler import REEL_LOCK_S, Reeler
-from .vision import PowerBar, cast_grade, cast_text_crop
+from .vision import PowerBar, appraise_row, cast_grade, cast_text_crop
 
 # Reel entry (fisch_data.lua, Windows values).
 STALE_S = 0.250
@@ -87,6 +87,9 @@ TOTEM_POST_USE_S = 0.70
 TOTEM_SAME_CYCLE_RETRY_S = 12.0  # day totem re-fires while it is still day
 TOTEM_INTER_FIRE_S = 8.0
 ROD_EQUIP_SETTLE_S = 0.40
+
+APPRAISE_SETTLE_S = 1.5         # after choosing the dialog's appraise option, lets the re-roll write back the fish's name and weight
+APPRAISE_WRITEBACK_S = 3.0      # give up waiting for that write-back after this long
 
 POTION_EQUIP_SETTLE_S = 0.80
 POTION_POST_USE_S = 1.00
@@ -309,6 +312,7 @@ class Stats:
     shake_clicks: int = 0
     shake_timeouts: int = 0
     totems: int = 0
+    appraisals: int = 0
     cast_grades: dict = field(default_factory=dict)     # grade -> casts that got it
     potion_rounds: int = 0
     aquarium_sweeps: int = 0
@@ -494,6 +498,10 @@ class Macro:
         self.totem_last_fire = -math.inf
         self.totem_next_fire = -math.inf
         self.totem_depleted = set()     # cycles whose totem ran out this run; that half stays off
+        self.appraise_sig = None        # the appraise settings the counters below belong to
+        self.appraise_attempts = 0
+        self.appraise_spent = 0
+        self.appraise_over = None       # why appraising stopped ("goal met: ..."), once it has
 
     # -- helpers -------------------------------------------------------------
 
@@ -798,6 +806,10 @@ class Macro:
             self.phase = "cast"
 
     def _idle_step(self, now):
+        if self.cfg.appraise.enabled:
+            self._appraise_step()
+            self._mark_activity()
+            return
         if self.cfg.aquarium.enabled and time.time() >= _read_float(self.aquarium_timer):
             self._aquarium_sweep()
             self.shaker.reset()
@@ -923,7 +935,7 @@ class Macro:
             items = self.ui.hotbar()
             if items is None:
                 return "wait", name, None
-            match = next(((s, n, c) for s, (n, c) in sorted(items.items()) if name.lower() in n.lower()), None)
+            match = next(((s, n, c) for s, (n, c, _w) in sorted(items.items()) if name.lower() in n.lower()), None)
             if match is None:
                 return "gone", name, None
             slot, item, count = match
@@ -972,6 +984,89 @@ class Macro:
         self.totem_next_fire = self.totem_last_fire + TOTEM_SAME_CYCLE_RETRY_S
         self.recast_anchor = None
         return "used"
+
+    # -- appraise (the Appraiser NPC's dialog) --------------------------------------
+
+    def _appraise_fish(self):
+        """(name, weight in kg or None) of the fish in the appraise slot, or None."""
+        items = self.ui.hotbar() if self.ui else None
+        entry = items.get(self.cfg.appraise.slot) if items else None
+        return (entry[0], entry[2]) if entry else None
+
+    def _appraise_goal(self, name, kg):
+        a = self.cfg.appraise
+        mut = a.mutation.strip().lower()
+        if mut and mut not in name.lower():
+            return False
+        return a.min_weight_kg <= 0 or (kg is not None and kg >= a.min_weight_kg)
+
+    def _appraise_stop(self, why):
+        self.appraise_over = why
+        self.log(f"appraise: {why}")
+        self.notify(f"Appraise stopped: {why}.")
+
+    def _appraise_step(self):
+        """One appraisal: click the dialog's appraise option (found on screen
+        with OCR — the dialog is a BillboardGui on the NPC, so its place
+        follows the camera), then read the re-rolled name and weight back
+        from the hotbar. The player
+        walks to the Appraiser and opens the dialog with the fish in hand;
+        while appraise is enabled it owns the idle step, so nothing is cast.
+        Stops for good when the goal is met or the attempts run out — every
+        attempt costs C$, so it never rolls without a goal or a cap."""
+        a = self.cfg.appraise
+        sig = (a.slot, a.mutation.strip().lower(), a.min_weight_kg, a.max_attempts)
+        if sig != self.appraise_sig:    # retargeting mid-run starts a fresh count
+            self.appraise_sig = sig
+            self.appraise_attempts = self.appraise_spent = 0
+            self.appraise_over = None
+        if self.appraise_over is not None:
+            self.status("appraise", self.appraise_over)
+            return
+        if self.ui is None:
+            self.status("appraise", "needs the game's memory")
+            return
+        if not a.mutation.strip() and a.min_weight_kg <= 0:
+            self.status("appraise", "set a mutation or a minimum weight first")
+            return
+        fish = self._appraise_fish()
+        if fish is None:
+            self.status("appraise", f"no fish readable in hotbar slot {a.slot}")
+            return
+        name, kg = fish
+        if self._appraise_goal(name, kg):
+            self._appraise_stop(f"goal met: {name}" + (f", {kg:g} kg" if kg is not None else "")
+                                + f" after {self.appraise_attempts} attempt(s), {self.appraise_spent} C$ spent")
+            return
+        if self.appraise_attempts >= a.max_attempts:
+            self._appraise_stop(f"{a.max_attempts} attempts without the goal (last: {name}"
+                                + (f", {kg:g} kg" if kg is not None else "") + f"), {self.appraise_spent} C$ spent")
+            return
+        price = self.ui.appraise_option()
+        if price is None:
+            self.status("appraise", "open the appraiser dialog and hold the fish")
+            return
+        row = None
+        for _ in range(2):      # a missed OCR read costs a second look, never a blind click
+            row = appraise_row(self.grab_window())
+            if row is not None:
+                break
+        if row is None:
+            self.status("appraise", "the dialog's appraise option is not readable on screen")
+            return
+        self.pointer.use_click(self.win.x + row[0], self.win.y + row[1])
+        self.appraise_attempts += 1
+        self.stats.appraisals += 1
+        self.appraise_spent += price
+        self.sleep(APPRAISE_SETTLE_S)
+        deadline = time.monotonic() + APPRAISE_WRITEBACK_S
+        while self._appraise_fish() in (fish, None) and time.monotonic() < deadline:
+            self.sleep(0.1)
+        name, kg = self._appraise_fish() or fish
+        weight = f"{kg:g} kg" if kg is not None else "weight unreadable"
+        self.log(f"appraise #{self.appraise_attempts}: {name}, {weight} "
+                 f"(paid {price} C$, {self.appraise_spent} C$ in all)")
+        self.status("appraise", f"attempt {self.appraise_attempts}: {name}, {weight}")
 
     # -- potions (fisch_potions.lua) -------------------------------------------------
 
