@@ -5,7 +5,6 @@ are saved without a save button. Colours follow the desktop's matugen
 palette when it exists; the hotkey keeps working while the window is open.
 """
 
-import json
 import os
 import queue
 import sys
@@ -32,6 +31,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -41,13 +41,33 @@ from .app import Controller, Log, assets_installed, single_instance
 from .config import DATA_DIR, STATE_DIR
 from .recovery import ROUTE_FILE, RouteRecorder, load_route, save_route
 
-PALETTE_FILE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ryoku" / "colors.json"
-FALLBACK_PALETTE = {
-    "surface": "#131313", "surfaceContainerLowest": "#0e0e0e", "surfaceContainerLow": "#1b1b1b",
-    "surfaceContainer": "#1f1f1f", "surfaceContainerHigh": "#2a2a2a", "surfaceContainerHighest": "#353535",
-    "onSurface": "#e3e3e3", "onSurfaceVariant": "#c6c6c6", "outline": "#909090", "outlineVariant": "#474747",
-    "primary": "#c6c6c6", "onPrimary": "#303030",
+# Deliberately muted themes; the user picks one in the sidebar and it is
+# kept in [general] theme.
+THEMES = {
+    "gece": {
+        "surface": "#121518", "surfaceContainerLowest": "#0d1013", "surfaceContainerLow": "#16191d",
+        "surfaceContainer": "#1a1e23", "surfaceContainerHigh": "#23282e", "surfaceContainerHighest": "#2e343c",
+        "onSurface": "#dee2e4", "onSurfaceVariant": "#a9aeb2", "outline": "#787f85", "outlineVariant": "#33393f",
+        "primary": "#8fb3aa", "onPrimary": "#12211d",
+    },
+    "gunduz": {
+        "surface": "#edebe5", "surfaceContainerLowest": "#e0dbcf", "surfaceContainerLow": "#e6e2d8",
+        "surfaceContainer": "#dfdbd0", "surfaceContainerHigh": "#d3cec0", "surfaceContainerHighest": "#c4bda9",
+        "onSurface": "#2a2d2b", "onSurfaceVariant": "#5c615a", "outline": "#7c7f76", "outlineVariant": "#c3bcab",
+        "primary": "#71827a", "onPrimary": "#f4f6f2",
+    },
+    "siyah-beyaz": {
+        "surface": "#101010", "surfaceContainerLowest": "#0a0a0a", "surfaceContainerLow": "#141414",
+        "surfaceContainer": "#1a1a1a", "surfaceContainerHigh": "#232323", "surfaceContainerHighest": "#303030",
+        "onSurface": "#ededed", "onSurfaceVariant": "#ababab", "outline": "#7a7a7a", "outlineVariant": "#333333",
+        "primary": "#e8e8e8", "onPrimary": "#101010",
+    },
 }
+THEME_CHOICES = (("gece", "Gece"), ("gunduz", "Gündüz"), ("siyah-beyaz", "Siyah-Beyaz"))
+
+
+def theme_palette(name):
+    return dict(THEMES.get(name, THEMES["gece"]))
 UI_FONTS = ("Space Grotesk", "Inter", "Noto Sans")
 LOG_FONTS = ("SpaceMono Nerd Font", "Space Mono", "JetBrains Mono", "Noto Sans Mono")
 REFRESH_MS = 200
@@ -61,15 +81,6 @@ CAST_GRADE_CHOICES = (("meh", "Meh"), ("fine", "Fine"), ("good", "Good"),
 # The fishing cycle shown at the top; idle-chain phases count as casting.
 STEPS = ("Atış", "Shake", "Çekme")
 STEP_OF_PHASE = {"starting": 0, "cast": 0, "idle": 0, "totem": 0, "appraise": 0, "potions": 0, "aquarium": 0, "shake": 1, "reel": 2}
-
-
-def load_palette():
-    palette = dict(FALLBACK_PALETTE)
-    try:
-        palette.update({k: v for k, v in json.loads(PALETTE_FILE.read_text()).items() if k in palette})
-    except (OSError, ValueError):
-        pass
-    return palette
 
 
 def pick_font(candidates):
@@ -89,6 +100,11 @@ def stylesheet(p, ui_font, log_font):
                    border-bottom: 2px solid transparent; }}
     QLabel#step[active="true"] {{ color: {p['onSurface']}; border-bottom: 2px solid {p['primary']}; }}
     QLabel#detail {{ color: {p['onSurfaceVariant']}; }}
+    QWidget#sidebar {{ background: {p['surfaceContainerLow']}; }}
+    QLabel#page-title {{ font-size: 16px; font-weight: 600; padding-bottom: 4px; }}
+    QPushButton#nav {{ text-align: left; background: transparent; color: {p['onSurfaceVariant']}; padding: 9px 12px; border-radius: 8px; }}
+    QPushButton#nav:hover {{ background: {p['surfaceContainer']}; }}
+    QPushButton#nav:checked {{ background: {p['surfaceContainerHigh']}; color: {p['onSurface']}; font-weight: 500; }}
     QFrame#rule {{ background: {p['outlineVariant']}; max-height: 1px; }}
     QPushButton {{ background: {p['surfaceContainerHigh']}; border: none; border-radius: 6px; padding: 7px 14px; }}
     QPushButton:hover {{ background: {p['surfaceContainerHighest']}; }}
@@ -105,10 +121,10 @@ def stylesheet(p, ui_font, log_font):
     QSlider::sub-page:horizontal {{ background: {p['primary']}; border-radius: 2px; }}
     QSlider::handle:horizontal {{ background: {p['onSurface']}; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}
     QSlider:focus::handle:horizontal {{ background: {p['primary']}; }}
-    QSpinBox, QLineEdit {{ background: {p['surfaceContainerHigh']}; border: 1px solid transparent; border-radius: 4px;
+    QSpinBox, QDoubleSpinBox, QLineEdit {{ background: {p['surfaceContainerHigh']}; border: 1px solid transparent; border-radius: 4px;
                           padding: 4px 6px; selection-background-color: {p['primary']}; selection-color: {p['onPrimary']}; }}
-    QSpinBox:focus, QLineEdit:focus {{ border: 1px solid {p['outline']}; }}
-    QSpinBox::up-button, QSpinBox::down-button {{ width: 0; border: none; }}
+    QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus {{ border: 1px solid {p['outline']}; }}
+    QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 0; border: none; }}
     QScrollArea {{ border: none; }}
     QScrollBar:vertical {{ background: transparent; width: 8px; }}
     QScrollBar::handle:vertical {{ background: {p['surfaceContainerHighest']}; border-radius: 4px; min-height: 24px; }}
@@ -165,25 +181,35 @@ class Window(QWidget):
         self.route_ended_at = -ROUTE_HOTKEY_GRACE_S
 
         self.setWindowTitle("FischAI")
-        self.resize(480, 820)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(22, 18, 22, 16)
-        root.setSpacing(10)
-        root.addLayout(self._header())
-        root.addLayout(self._cycle())
+        self.resize(920, 640)
+        self.setMinimumSize(780, 540)
+        self.switches = []
+        self.grid = None
+        self.nav_buttons = []
+        self.stack = QStackedWidget()
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._sidebar())
+        right = QWidget()
+        root.addWidget(right, 1)
+        col = QVBoxLayout(right)
+        col.setContentsMargins(20, 16, 20, 14)
+        col.setSpacing(10)
+        col.addLayout(self._header())
+        col.addLayout(self._cycle())
         self.detail = QLabel(objectName="detail", wordWrap=True)
         self.counters = QLabel(objectName="muted")
-        root.addWidget(self.detail)
-        root.addWidget(self.counters)
-        root.addWidget(QFrame(objectName="rule"))
-        scroll = QScrollArea(widgetResizable=True)
-        scroll.setWidget(self._settings())
-        root.addWidget(scroll, 1)
+        col.addWidget(self.detail)
+        col.addWidget(self.counters)
+        col.addWidget(QFrame(objectName="rule"))
+        col.addWidget(self._settings(), 1)
         self.logview = QPlainTextEdit(objectName="log", readOnly=True, maximumBlockCount=LOG_LINES)
-        self.logview.setFixedHeight(110)
-        root.addWidget(self.logview)
+        self.logview.setFixedHeight(84)
+        col.addWidget(self.logview)
         self.footer = QLabel(objectName="hint")
-        root.addWidget(self.footer)
+        col.addWidget(self.footer)
+        self._show_page(0)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -211,14 +237,48 @@ class Window(QWidget):
         row.addStretch(1)
         return row
 
+    def _sidebar(self):
+        box = QWidget(objectName="sidebar")
+        box.setFixedWidth(196)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 18, 14, 14)
+        lay.setSpacing(4)
+        lay.addWidget(QLabel("FischAI", objectName="title"))
+        lay.addSpacing(14)
+        self.nav_layout = QVBoxLayout()
+        self.nav_layout.setSpacing(4)
+        lay.addLayout(self.nav_layout)
+        lay.addStretch(1)
+        lay.addWidget(QLabel("Tema", objectName="muted"))
+        self.theme_buttons = {}
+        group = QButtonGroup(self)
+        for key, text in THEME_CHOICES:
+            button = QPushButton(text, objectName="nav", checkable=True)
+            button.setChecked(self.cfg.general.theme == key)
+            button.clicked.connect(lambda _c, key=key: self._apply_theme(key))
+            group.addButton(button)
+            self.theme_buttons[key] = button
+            lay.addWidget(button)
+        return box
+
+    def _show_page(self, index):
+        self.stack.setCurrentIndex(index)
+        for i, button in enumerate(self.nav_buttons):
+            button.setChecked(i == index)
+
+    def _apply_theme(self, key):
+        self._set(self.cfg.general, "theme", key)
+        self.p = theme_palette(key)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(stylesheet(self.p, pick_font(UI_FONTS), pick_font(LOG_FONTS)))
+        for switch in self.switches:
+            switch._p = self.p
+            switch.update()
+        for name, button in self.theme_buttons.items():
+            button.setChecked(name == key)
+
     def _settings(self):
-        page = QWidget()
-        self.grid = QGridLayout(page)
-        self.grid.setContentsMargins(0, 0, 8, 0)
-        self.grid.setHorizontalSpacing(14)
-        self.grid.setVerticalSpacing(8)
-        self.grid.setColumnStretch(1, 1)
-        self.row = 0
         c = self.cfg
 
         self._section("Balık tutma")
@@ -293,7 +353,7 @@ class Window(QWidget):
                      hint=f"Her tıklamada ve aşama değişiminde gördüğü kareyi, tıkladığı yer işaretli olarak "
                           f"{folder} içine kaydeder (en fazla 400 görüntü).")
         self.grid.setRowStretch(self.row, 1)
-        return page
+        return self.stack
 
     def _place(self, label, widget, hint=None):
         self.grid.addWidget(QLabel(label), self.row, 0)
@@ -304,11 +364,30 @@ class Window(QWidget):
             self.row += 1
 
     def _section(self, title):
-        self.grid.addWidget(QLabel(title, objectName="section"), self.row, 0, 1, 3)
+        """Start a settings page in the stack and its sidebar entry."""
+        if self.grid is not None:
+            self.grid.setRowStretch(self.row, 1)
+        page = QWidget()
+        self.grid = QGridLayout(page)
+        self.grid.setContentsMargins(0, 0, 8, 0)
+        self.grid.setHorizontalSpacing(14)
+        self.grid.setVerticalSpacing(8)
+        self.grid.setColumnStretch(1, 1)
+        self.row = 0
+        self.grid.addWidget(QLabel(title, objectName="page-title"), self.row, 0, 1, 3)
         self.row += 1
+        scroll = QScrollArea(widgetResizable=True)
+        scroll.setWidget(page)
+        self.stack.addWidget(scroll)
+        button = QPushButton(title, objectName="nav", checkable=True)
+        index = len(self.nav_buttons)
+        button.clicked.connect(lambda _c, i=index: self._show_page(i))
+        self.nav_layout.addWidget(button)
+        self.nav_buttons.append(button)
 
     def _switch(self, label, target, attr, hint=None):
         switch = Switch(self.p)
+        self.switches.append(switch)
         switch.setChecked(getattr(target, attr))
         switch.toggled.connect(lambda on: self._set(target, attr, on))
         holder = QHBoxLayout()
@@ -624,8 +703,6 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("FischAI")
     app.setDesktopFileName("fischai")
-    palette = load_palette()
-    app.setStyleSheet(stylesheet(palette, pick_font(UI_FONTS), pick_font(LOG_FONTS)))
     if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
         QMessageBox.critical(None, "FischAI", "FischAI yalnız Hyprland oturumunda çalışır.")
         return
@@ -634,6 +711,8 @@ def main():
     except config.ConfigError as e:
         QMessageBox.critical(None, "Ayar dosyası hatalı", f"{config.CONFIG_PATH}\n\n{e}")
         return
+    palette = theme_palette(cfg.general.theme)
+    app.setStyleSheet(stylesheet(palette, pick_font(UI_FONTS), pick_font(LOG_FONTS)))
     try:
         with single_instance():
             _run(app, cfg, palette)

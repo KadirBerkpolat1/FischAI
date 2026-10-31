@@ -29,6 +29,7 @@ TEMPLATE = """\
 
 [general]
 hotkey = {general_hotkey}          # start / stop
+theme = {general_theme}            # gece | gunduz | siyah-beyaz
 window = {general_window}          # window class, or a title substring
 memory = {general_memory}          # read the shake button, reel and power bar from the game's memory (read-only); off = screen only
 debug_snapshots = {general_debug_snapshots}  # save what the macro saw at each click and phase change
@@ -87,6 +88,7 @@ summary_min = {webhook_summary_min}
 @dataclass
 class General:
     hotkey: str = "f3"
+    theme: str = "gece"
     window: str = "org.vinegarhq.Sober"
     memory: bool = True
     debug_snapshots: bool = False
@@ -185,6 +187,8 @@ def _check(cond, message):
 
 def _validate(cfg):
     keycode(cfg.general.hotkey)
+    _check(cfg.general.theme in ("gece", "gunduz", "siyah-beyaz"),
+           "general.theme must be gece, gunduz or siyah-beyaz")
     f, r = cfg.fishing, cfg.reel
     _check(f.cast_grade in CAST_GRADES, f"fishing.cast_grade must be one of {', '.join(CAST_GRADES)}")
     _check(50 <= f.cast_hold_ms <= 5000, "fishing.cast_hold_ms must be 50-5000")
